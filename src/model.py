@@ -1,24 +1,25 @@
-
 '''
 Transformer Model from Scratch (only using Linear & Dropout)
-Composition:
 
-1. Model Class
-    1) Encoder Class
-        a. input embedding
-        b. positional encoding
-        c. multi-head attention
-        d. feedforward
-        e. normalization
-    2) Decoder Class
-        a. input embedding
-        b. positional encoding
-        c. masked multi-head attention
-        d. multi-head attention
-        e. feedforward
-        f. normalization
-    3) Transformer Class
-        a. integrate encoders and decoders
+Architecture:
+    1. Encoder: pre-norm self-attention + feedforward (× N stacks)
+    2. Decoder: pre-norm masked self-attn + cross-attn + feedforward (× N stacks)
+    3. TransformerModel: encode → decode pipeline
+
+Optimizations over original:
+    - Separate encode()/decode() so the encoder runs once during inference
+    - KV cache for autoregressive generation (decoder self-attn & cross-attn)
+    - register_buffer for positional encoding & causal mask (auto .to(device))
+    - Fixed attention scaling: sqrt(head_dim) instead of sqrt(embed_dim)
+    - Each sub-layer uses its own dedicated LayerNorm
+    - Dropout applied to attention weights (per the paper)
+    - bf16 save/load utilities
+    - Vectorized beam search (all beams batched as a single tensor)
+
+NOTE: The attention scaling fix (head_dim vs embed_dim) and layer-norm fix
+      change model behaviour. Existing checkpoints trained with the old code
+      will produce different results. Use strict=False when loading old
+      checkpoints (new register_buffer keys won't exist in old state_dicts).
 '''
 
 import torch
@@ -26,392 +27,511 @@ from torch.nn import Module, ModuleList, Linear, ReLU, Dropout, LayerNorm, Seque
 import torch.nn.functional as F
 import math
 
-# Grouped Attention for K, V is used (multi query attention)
+
+# --------------------------------------------------------------------------- #
+#  Multi-Head Attention with KV Cache                                         #
+# --------------------------------------------------------------------------- #
 class MultiheadAttentionCustom(Module):
-    def __init__(self, embed_dim:int, num_heads:int, dropout:float, batch_first:bool=True):
-        super(MultiheadAttentionCustom, self).__init__()
+    """
+    Multi-head scaled dot-product attention.
+
+    Supports two caching modes controlled by ``use_cache`` / ``is_cross_attn``:
+      • Self-attention cache  – new K,V are appended to the cache each step.
+      • Cross-attention cache – K,V are computed once from encoder output and
+                                 reused on every subsequent step.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
 
-        # Calculate all heads at once
-        self.Q = Linear(in_features=embed_dim, out_features=embed_dim, bias=False)
-        self.K = Linear(in_features=embed_dim, out_features=embed_dim, bias=False)
-        self.V = Linear(in_features=embed_dim, out_features=embed_dim, bias=False)
+        self.Q = Linear(embed_dim, embed_dim, bias=False)
+        self.K = Linear(embed_dim, embed_dim, bias=False)
+        self.V = Linear(embed_dim, embed_dim, bias=False)
 
+        self.attn_dropout = Dropout(p=dropout)
+
+        # KV cache (populated during inference only)
         self.k_cache = None
         self.v_cache = None
-        
-        # simple dropout layer
-        self.dropout = Dropout(p=dropout)
 
-    def forward(self, query, key, value, pad_mask, attn_mask=None):
+    def clear_cache(self):
+        self.k_cache = None
+        self.v_cache = None
 
-        # logger.debug('Query shape: {}, Key shape: {}, Value shape: {}'.format(query.shape, key.shape, value.shape))
-        # logger.debug('Q shape: {}, K shape: {}, V shape: {}'.format(self.Q.shape, self.K.shape, self.V.shape))
+    def forward(self, query, key, value, pad_mask=None, attn_mask=None,
+                use_cache=False, is_cross_attn=False):
+        batch_size = query.size(0)
 
-        Q = self.Q(query)
-        K = self.K(key)
-        V = self.V(value)
+        # Project query → (batch, heads, seq_q, head_dim)
+        Q = self.Q(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # logger.debug('Q shape: {}'.format(Q.shape))
+        # ---------- K, V with optional caching ----------
+        if use_cache:
+            if is_cross_attn and self.k_cache is not None:
+                # Cross-attention: encoder K,V never change → reuse cache
+                K, V = self.k_cache, self.v_cache
+            else:
+                K_new = self.K(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                V_new = self.V(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # IMPORTANT: shape matters but it's not everything. should view to incomplete dimension
-        # and then transpose again to completely isolate the heads!
+                if not is_cross_attn and self.k_cache is not None:
+                    # Self-attention: append new token's K,V to history
+                    K = torch.cat([self.k_cache, K_new], dim=2)
+                    V = torch.cat([self.v_cache, V_new], dim=2)
+                else:
+                    # First step (or cross-attention first call): initialise cache
+                    K, V = K_new, V_new
 
-        Q = Q.view(query.size(0), query.size(1), self.num_heads, \
-                   self.embed_dim // self.num_heads).transpose(1, 2)
-        K = K.view(key.size(0), key.size(1), self.num_heads, \
-                   self.embed_dim // self.num_heads).transpose(1, 2)
-        V = V.view(value.size(0), value.size(1), self.num_heads, \
-                   self.embed_dim // self.num_heads).transpose(1, 2)
+                self.k_cache = K
+                self.v_cache = V
+        else:
+            # Training path – no caching
+            K = self.K(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            V = self.V(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        
-        # Number of simple multiplications: (len_input)^2 * (len_heads)
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.embed_dim)
+        # Scaled dot-product attention  (paper: scale by √d_k , d_k = head_dim)
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.head_dim)
 
-        # Mask the elements that are 0 in the lookahead mask
         if attn_mask is not None:
             scores = scores.masked_fill(attn_mask == 0, -1e4)
-        scores = scores.masked_fill(pad_mask == 0, -1e4)
-        
-        scores = torch.softmax(scores, dim=-1)
-        scores = torch.matmul(scores, V)
+        if pad_mask is not None:
+            scores = scores.masked_fill(pad_mask == 0, -1e4)
 
-        context = scores.transpose(1, 2).contiguous().view(scores.size(0), -1, self.embed_dim)
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
 
+        context = torch.matmul(attn_weights, V)
+        # Concatenate heads → (batch, seq, embed_dim)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
         return context
-        
 
+
+# --------------------------------------------------------------------------- #
+#  Encoder Layer                                                              #
+# --------------------------------------------------------------------------- #
 class Encoder(Module):
-    def __init__(self, embed_dim:int, num_heads:int, dropout_rate:float, hidden_layer_dim:int):
-        super(Encoder, self).__init__()
+    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, hidden_layer_dim: int):
+        super().__init__()
 
-        # Set hyperparams
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.dropout_rate = dropout_rate
-        self.hidden_layer_dim = hidden_layer_dim
-
-        # Multi-head attention layer
-        self.multihead_attention = \
-        MultiheadAttentionCustom(
-            embed_dim=self.embed_dim, 
-            num_heads=self.num_heads, 
-            dropout=self.dropout_rate,
-            batch_first=True
+        self.multihead_attention = MultiheadAttentionCustom(
+            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout_rate,
         )
-
-        # Feedforward network: use relu and dropout
-        self.feedforward = \
-        Sequential(
-            Linear(in_features=self.embed_dim, out_features=self.hidden_layer_dim, bias=True),
+        self.feedforward = Sequential(
+            Linear(embed_dim, hidden_layer_dim, bias=True),
             ReLU(),
-            Dropout(p=self.dropout_rate),
-            Linear(in_features=self.hidden_layer_dim, out_features=self.embed_dim, bias=True),
-            Dropout(p=self.dropout_rate)
+            Dropout(p=dropout_rate),
+            Linear(hidden_layer_dim, embed_dim, bias=True),
+            Dropout(p=dropout_rate),
         )
 
-        # Need two layer norms for each normalization
-        self.layer_norm_attn = LayerNorm(normalized_shape=self.embed_dim, eps=1e-05)
-        self.layer_norm_ffnn = LayerNorm(normalized_shape=self.embed_dim, eps=1e-05)
+        # Each sub-layer gets its own LayerNorm (pre-norm style)
+        self.layer_norm_attn = LayerNorm(embed_dim, eps=1e-05)
+        self.layer_norm_ffnn = LayerNorm(embed_dim, eps=1e-05)
 
     def forward(self, x, pad_mask):
-        # logger.debug('Input shape: {}'.format(x.shape))
-        x = self.layer_norm_attn(x)
-        attn_output = self.multihead_attention(query=x, key=x, value=x, pad_mask=pad_mask)
-        # logger.debug('Attn output shape: {}'.format(attn_output.shape))
-        attn_output = x + attn_output
+        # Pre-norm self-attention + residual
+        normed = self.layer_norm_attn(x)
+        attn_out = self.multihead_attention(query=normed, key=normed, value=normed, pad_mask=pad_mask)
+        x = x + attn_out
 
-        attn_output = self.layer_norm_attn(attn_output)
-        ffnn_output = self.feedforward(attn_output)
-        # logger.debug('FFNN output shape: {}'.format(ffnn_output.shape))
-        ffnn_output = ffnn_output + attn_output
-        return ffnn_output
-        
-    
+        # Pre-norm feedforward + residual  (FIX: uses layer_norm_ffnn, not layer_norm_attn)
+        normed = self.layer_norm_ffnn(x)
+        ffnn_out = self.feedforward(normed)
+        x = x + ffnn_out
+        return x
+
+
+# --------------------------------------------------------------------------- #
+#  Decoder Layer                                                              #
+# --------------------------------------------------------------------------- #
 class Decoder(Module):
-    def __init__(self, embed_dim:int, num_heads:int, dropout_rate:float, hidden_layer_dim:int):
-        super(Decoder, self).__init__()
+    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, hidden_layer_dim: int):
+        super().__init__()
 
-        # Set Hyperparameters
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.dropout_rate = dropout_rate
-        self.hidden_layer_dim = hidden_layer_dim
-
-        # Initialize layers
-        self.masked_multihead_attention = \
-        MultiheadAttentionCustom(
-            embed_dim=self.embed_dim,
-            num_heads=self.num_heads,
-            dropout=self.dropout_rate,
-            batch_first=True
+        self.masked_multihead_attention = MultiheadAttentionCustom(
+            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout_rate,
         )
-
-        self.multihead_attention = \
-        MultiheadAttentionCustom(
-            embed_dim=self.embed_dim, 
-            num_heads=self.num_heads, 
-            dropout=self.dropout_rate, 
-            batch_first=True
+        self.multihead_attention = MultiheadAttentionCustom(
+            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout_rate,
         )
-
-        self.feedforward = \
-        Sequential(
-            Linear(in_features=self.embed_dim, out_features=self.hidden_layer_dim, bias=True), 
+        self.feedforward = Sequential(
+            Linear(embed_dim, hidden_layer_dim, bias=True),
             ReLU(),
-            Dropout(p=self.dropout_rate),
-            Linear(in_features=self.hidden_layer_dim, out_features=self.embed_dim, bias=True),
-            Dropout(p=self.dropout_rate)
+            Dropout(p=dropout_rate),
+            Linear(hidden_layer_dim, embed_dim, bias=True),
+            Dropout(p=dropout_rate),
         )
 
-        self.layer_norm_mask_attn = LayerNorm(normalized_shape=self.embed_dim, eps=1e-05)
-        self.layer_norm_attn = LayerNorm(normalized_shape=self.embed_dim, eps=1e-05)
-        self.layer_norm_ffnn = LayerNorm(normalized_shape=self.embed_dim, eps=1e-05)
+        # Dedicated LayerNorm per sub-layer (FIX: previous code reused layer_norm_attn for all three)
+        self.layer_norm_mask_attn = LayerNorm(embed_dim, eps=1e-05)
+        self.layer_norm_attn = LayerNorm(embed_dim, eps=1e-05)
+        self.layer_norm_ffnn = LayerNorm(embed_dim, eps=1e-05)
 
-        self.k_cache = None
-        self.v_cache = None
-        
-    def forward(self, x, encoder_output, pad_mask, target_mask):
+    def clear_cache(self):
+        self.masked_multihead_attention.clear_cache()
+        self.multihead_attention.clear_cache()
 
-        # Apply masking to the first attention layer
-        x = self.layer_norm_attn(x)
-        masked_attn_output = self.masked_multihead_attention(query=x, key=x, value=x, pad_mask=pad_mask, attn_mask=target_mask)
-        masked_attn_output = x + masked_attn_output
-        
-        masked_attn_output = self.layer_norm_attn(masked_attn_output)
-        attn_output = self.multihead_attention(query=masked_attn_output, key=encoder_output, value=encoder_output, pad_mask=pad_mask)
+    def forward(self, x, encoder_output, pad_mask=None, target_mask=None,
+                use_cache=False, cross_attn_pad_mask=None):
+        # 1. Pre-norm masked self-attention + residual
+        normed = self.layer_norm_mask_attn(x)
+        masked_attn_out = self.masked_multihead_attention(
+            query=normed, key=normed, value=normed,
+            pad_mask=pad_mask, attn_mask=target_mask, use_cache=use_cache,
+        )
+        x = x + masked_attn_out
 
-        attn_output = masked_attn_output + attn_output
+        # 2. Pre-norm cross-attention + residual
+        normed = self.layer_norm_attn(x)
+        cross_mask = cross_attn_pad_mask if cross_attn_pad_mask is not None else pad_mask
+        attn_out = self.multihead_attention(
+            query=normed, key=encoder_output, value=encoder_output,
+            pad_mask=cross_mask, use_cache=use_cache, is_cross_attn=True,
+        )
+        x = x + attn_out
 
-        attn_output = self.layer_norm_attn(attn_output)
-        ffnn_output = self.feedforward(attn_output)
-        ffnn_output = attn_output + ffnn_output
-        return ffnn_output
+        # 3. Pre-norm feedforward + residual
+        normed = self.layer_norm_ffnn(x)
+        ffnn_out = self.feedforward(normed)
+        x = x + ffnn_out
+        return x
 
-'''
-Composite Model
-1. Get the embeddings of the input
-2. Apply positional encoding
-3. Apply encoders and decoders
-4. Apply final linear layer
-'''
+
+# --------------------------------------------------------------------------- #
+#  Transformer Model                                                          #
+# --------------------------------------------------------------------------- #
 class TransformerModel(Module):
+    """
+    Encoder-Decoder Transformer with:
+      • Separate encode / decode paths (encode source once for inference)
+      • KV caching for fast autoregressive decoding
+      • Registered buffers for PE and causal mask (auto .to(device))
+      • bf16 checkpoint save / load
+      • Vectorized beam search
+    """
 
-    def __init__(self, embed_dim:int, num_heads:int, dropout_rate:float, hidden_layer_dim:int, max_len:int, vocab_size:int, stacks:int):
+    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float,
+                 hidden_layer_dim: int, max_len: int, vocab_size: int, stacks: int):
+        super().__init__()
 
-        # Set Hyperparameters
         self.max_len = max_len
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout_rate = dropout_rate
         self.hidden_layer_dim = hidden_layer_dim
         self.vocab_size = vocab_size
+        self.embed_scale = math.sqrt(embed_dim)
 
-        super(TransformerModel, self).__init__()
+        # Embedding layers
+        self.token_embedding = Embedding(vocab_size, embed_dim)
+        self.token_embedding_dec = Embedding(vocab_size, embed_dim)
 
-        # Embedding layer
-        self.token_embedding = Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
-        self.token_embedding_dec = Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
-        
-
-        # 6 encoders and decoders layer
+        # Encoder / Decoder stacks
         self.encoders = ModuleList([
-            Encoder(
-                embed_dim=embed_dim, 
-                num_heads=num_heads,
-                dropout_rate=dropout_rate, 
-                hidden_layer_dim=hidden_layer_dim,
-            ) for _ in range(stacks)
+            Encoder(embed_dim, num_heads, dropout_rate, hidden_layer_dim)
+            for _ in range(stacks)
         ])
-
         self.decoders = ModuleList([
-            Decoder(
-                embed_dim=embed_dim, 
-                num_heads=num_heads, 
-                dropout_rate=dropout_rate, 
-                hidden_layer_dim=hidden_layer_dim,
-            ) for _ in range(stacks)
+            Decoder(embed_dim, num_heads, dropout_rate, hidden_layer_dim)
+            for _ in range(stacks)
         ])
 
-        # Pre-calculate the positional encoding
-        self.positional_encoding = self._generate_positional_encoding(max_len=max_len, embed_dim=embed_dim)
+        # Fixed tensors → register_buffer (move with model, saved in state_dict)
+        self.register_buffer(
+            'positional_encoding',
+            self._generate_positional_encoding(max_len, embed_dim),
+        )
+        self.register_buffer(
+            'causal_mask',
+            torch.tril(torch.ones(max_len, max_len)),
+        )
 
-        # Last linear layer right before softmax
-        self.final_layer_norm = LayerNorm(self.embed_dim)
-        self.output_layer = Linear(in_features=embed_dim, out_features=vocab_size, bias=True)
-    
-    # The positional encoding function that is called before fed into encoders or decoders
-    def _generate_positional_encoding(self, max_len, embed_dim):
+        # Output head
+        self.final_layer_norm = LayerNorm(embed_dim)
+        self.output_layer = Linear(embed_dim, vocab_size, bias=True)
+
+        # Decode-position tracker for KV cache (not saved in state_dict)
+        self._decode_pos = 0
+
+    # ------------------------------------------------------------------ #
+    #  Positional encoding                                                #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _generate_positional_encoding(max_len, embed_dim):
         pe = torch.zeros(max_len, embed_dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+        div_term = torch.exp(
+            torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        return pe
-    
+        return pe.unsqueeze(0)  # (1, max_len, embed_dim)
+
+    # ------------------------------------------------------------------ #
+    #  Mask helpers                                                       #
+    # ------------------------------------------------------------------ #
+    def _make_src_pad_mask(self, src):
+        """2D pad mask for encoder self-attention: (B, H, S, S)."""
+        mask = (src != 0)  # (B, S)
+        col_mask = mask.unsqueeze(1).unsqueeze(2)   # (B, 1, 1, S)
+        row_mask = mask.unsqueeze(1).unsqueeze(3)   # (B, 1, S, 1)
+        return (col_mask & row_mask).expand(-1, self.num_heads, -1, -1)
+
+    def _make_tgt_pad_mask(self, tgt):
+        """Key-side pad mask for decoder self-attention: (B, H, 1, T)."""
+        mask = (tgt != 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+        return mask.expand(-1, self.num_heads, -1, -1)
+
+    def _make_cross_attn_pad_mask(self, src):
+        """Source key-side pad mask for cross-attention: (B, H, 1, S)."""
+        mask = (src != 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
+        return mask.expand(-1, self.num_heads, -1, -1)
+
+    # ------------------------------------------------------------------ #
+    #  Encode / Decode  (separable for efficient inference)               #
+    # ------------------------------------------------------------------ #
+    def encode(self, src):
+        """Encode source tokens → encoder hidden states (B, S, E)."""
+        pad_mask = self._make_src_pad_mask(src)
+        x = self.token_embedding(src) * self.embed_scale
+        x = x + self.positional_encoding[:, :src.size(1)]
+        for encoder in self.encoders:
+            x = encoder(x, pad_mask)
+        return x
+
+    def decode(self, tgt, encoder_output, tgt_pad_mask=None,
+               cross_attn_pad_mask=None, use_cache=False):
+        """
+        Decode target tokens given encoder output.
+
+        Training  → full tgt sequence, use_cache=False
+        Inference → single new token per step, use_cache=True
+        """
+        seq_len = tgt.size(1)
+        x = self.token_embedding_dec(tgt) * self.embed_scale
+
+        # Positional encoding (track cumulative position when caching)
+        if use_cache:
+            x = x + self.positional_encoding[:, self._decode_pos:self._decode_pos + seq_len]
+            self._decode_pos += seq_len
+        else:
+            x = x + self.positional_encoding[:, :seq_len]
+
+        # Causal mask: unnecessary when using KV cache with a single token
+        target_mask = (
+            None if (use_cache and seq_len == 1)
+            else self.causal_mask[:seq_len, :seq_len]
+        )
+
+        for decoder in self.decoders:
+            x = decoder(
+                x, encoder_output,
+                pad_mask=tgt_pad_mask, target_mask=target_mask,
+                use_cache=use_cache, cross_attn_pad_mask=cross_attn_pad_mask,
+            )
+
+        x = self.final_layer_norm(x)
+        return self.output_layer(x)
+
+    def clear_cache(self):
+        """Reset all decoder KV caches and decode position counter."""
+        for decoder in self.decoders:
+            decoder.clear_cache()
+        self._decode_pos = 0
+
+    # ------------------------------------------------------------------ #
+    #  Combined forward  (training)                                       #
+    # ------------------------------------------------------------------ #
     def forward(self, src, tgt):
+        """Full forward pass for teacher-forced training (no caching)."""
+        tgt_pad_mask = self._make_tgt_pad_mask(tgt)
+        cross_attn_pad_mask = self._make_cross_attn_pad_mask(src)
 
-        pad_mask_left = (src != 0).unsqueeze(1).unsqueeze(1)
-        pad_mask_left = pad_mask_left.expand(-1, self.num_heads, src.size(1), src.size(1))
-        pad_mask_right = pad_mask_left.transpose(-1, -2)
-        pad_mask_src = pad_mask_left & pad_mask_right
-        pad_mask_src = pad_mask_src.to(device=src.device)
+        encoder_output = self.encode(src)
+        return self.decode(
+            tgt, encoder_output,
+            tgt_pad_mask=tgt_pad_mask,
+            cross_attn_pad_mask=cross_attn_pad_mask,
+            use_cache=False,
+        )
 
-        pad_mask_left = (tgt != 0).unsqueeze(1).unsqueeze(1)
-        pad_mask_right = pad_mask_left.transpose(-1, -2)
-        pad_mask_tgt = pad_mask_right
-        pad_mask_tgt = pad_mask_tgt.to(device=tgt.device)
+    # ------------------------------------------------------------------ #
+    #  bf16 save / load                                                   #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def save_bf16(model, path):
+        """Save model checkpoint in bfloat16 (≈50 % smaller file)."""
+        state_dict = {
+            k: v.to(torch.bfloat16) if v.is_floating_point() else v
+            for k, v in model.state_dict().items()
+        }
+        torch.save(state_dict, path)
 
+    @staticmethod
+    def load_bf16(model, path, device='cpu'):
+        """Load a bf16 checkpoint, casting back to float32 for training."""
+        state_dict = torch.load(path, map_location=device, weights_only=True)
+        state_dict = {
+            k: v.to(torch.float32) if v.is_floating_point() else v
+            for k, v in state_dict.items()
+        }
+        model.load_state_dict(state_dict, strict=False)
+        return model
 
-        # 1. Get the embeddings of the input
-        # print(src.shape, self.token_embedding(src).shape)
-        src = self.token_embedding(src)
-        src *= math.sqrt(self.embed_dim)
-        # logger.debug('After embedding: {}'.format(src.shape))
+    # ------------------------------------------------------------------ #
+    #  Greedy generation with KV cache                                    #
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def greedy_generate(self, src, bos_token_id, eos_token_id, max_len=None):
+        """
+        Fast greedy decoding: encode once → decode token-by-token with KV cache.
 
-        # 2. Apply positional encoding
-        # print(src.shape, self.positional_encoding[:, :src.size(1), :].shape)
-        # logger.debug('src_dim: {}, positional_encoding_dim: {}'.format(src.shape, self.positional_encoding[:, :src.size(1), :].shape))
-        src = src + self.positional_encoding[:, :src.size(1), :].to(src.device)
+        Returns: (batch, ≤max_len) token ids including BOS, padded with 0.
+        """
+        if max_len is None:
+            max_len = self.max_len
 
-        # 1. Get the embeddings of the input
-        tgt = self.token_embedding_dec(tgt)
-        # logger.debug('After embedding: {}'.format(tgt.shape))
+        self.eval()
+        device = src.device
+        batch_size = src.size(0)
 
-        # 2. Apply positional encoding
-        tgt = tgt + self.positional_encoding[:, :tgt.size(1), :].to(tgt.device)
-        # logger.debug('After positional encoding: {}'.format(tgt.shape))
+        # Encode source ONCE
+        encoder_output = self.encode(src)
+        cross_mask = self._make_cross_attn_pad_mask(src)
 
-        # Get the target mask for the decoder
-        target_mask = torch.tril(torch.ones(tgt.shape[1], tgt.shape[1]), diagonal=0)
-        target_mask = target_mask.to(tgt.device)
-        
-        # 3. Apply encoders and decoders
-        for idx, encoder in enumerate(self.encoders):   
-            # logger.debug(f'----------Encoder layer {idx+1}----------')
-            src = encoder(src, pad_mask_src)
-            # logger.debug('Encoder output[{}]: {}'.format(idx+1, src[0]))
-            
-        
-        encoder_output = src
-        
-        for idx, decoder in enumerate(self.decoders):
-            # logger.debug(f'----------Decoder layer {idx+1}----------')
-            tgt = decoder(tgt, encoder_output, pad_mask_tgt, target_mask)
-            # logger.debug('Decoder output[{}]: {}'.format(idx+1, tgt[0]))
+        # Initialise with BOS
+        current_token = torch.full((batch_size, 1), bos_token_id,
+                                   dtype=torch.long, device=device)
+        generated = [current_token]
+        done = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        for idx, decoder in enumerate(self.decoders):
-            decoder.multihead_attention.k_cache = None 
-            decoder.multihead_attention.v_cache = None
-        # 4. Get the output of the last linear layer
-        result = self.final_layer_norm(tgt)
-        result = self.output_layer(result)
+        self.clear_cache()
 
-        return result
-    
-    def generate_translation(self, input_sentences, n_candidates, bos_token_id, eos_token_id):
-        '''
-        @param input_sentences: list of strings, tokenized, batched (batch_size, max_len)
-        @param n_candidates: number of translation candidates to generate
-        @return: list of strings
-        '''
-        batch_size = len(input_sentences)
-        device = next(self.parameters()).device
-        
-        # Get special token IDs
-        start_token_id = bos_token_id
-        end_token_id = eos_token_id
+        for _ in range(max_len - 1):
+            logits = self.decode(current_token, encoder_output,
+                                 cross_attn_pad_mask=cross_mask, use_cache=True)
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
-        # For each sentence in the batch
-        all_translations = []
+            # Pad finished sequences with 0
+            next_token = next_token.masked_fill(done.unsqueeze(-1), 0)
+            generated.append(next_token)
 
-        for sentence_idx, input_sentence in enumerate(input_sentences):
-            # Encode the input sentence
-            encoder_input = torch.tensor(input_sentence, device=device)
-            #encoder_outputs = self.encoder(encoder_input)
-            
-            # Initialize with start token
-            current_beams = [(torch.tensor([[start_token_id]], device=device), 0.0)]  # (sequence tensor, log_prob)
-            
-            # Continue until all beams have generated an end token or reached max length
-            max_length = 100  # Set a reasonable max length
-            finished_beams = []
-            
-            while len(current_beams) > 0 and len(finished_beams) < n_candidates:
-                all_next_beams = []
-                
-                for beam_idx, (beam_sequence, beam_score) in enumerate(current_beams):
-                    # Skip if the beam is already finished
-                    if beam_sequence[0, -1].item() == end_token_id:
-                        finished_beams.append((beam_sequence, beam_score))
-                        continue
-                    
-                    # Get decoder output for the current beam
-                    with torch.no_grad():
-                        decoder_output = self(encoder_input, beam_sequence) #self.decoder(beam_sequence, encoder_outputs)
-                        logits = self.output_layer(decoder_output[:, -1, :])
-                        log_probs = F.log_softmax(logits, dim=-1)
-                    
-                    # Get top-k candidates for the next token
-                    topk_log_probs, topk_indices = log_probs.topk(n_candidates)
-                    
-                    # Create new beam candidates
-                    for i in range(len(topk_indices)):
-                        token_id = topk_indices[i].item()
-                        token_log_prob = topk_log_probs[i].item()
-                        
-                        # Create new sequence by appending the token
-                        new_sequence = torch.cat([beam_sequence, 
-                                                torch.tensor([[token_id]], device=device)], dim=1)
-                        new_score = beam_score + token_log_prob
-                        
-                        # Add to finished beams if end token, otherwise to candidates
-                        if token_id == end_token_id:
-                            finished_beams.append((new_sequence, new_score))
-                        else:
-                            all_next_beams.append((new_sequence, new_score))
-                
-                # If we have enough finished beams, we're done
-                if len(finished_beams) >= n_candidates:
-                    break
-                    
-                # Sort and keep top beams for next iteration
-                all_next_beams = sorted(all_next_beams, key=lambda x: x, reverse=True)
-                current_beams = all_next_beams[:n_candidates - len(finished_beams)]
-                
-                # Check for max length
-                if all(beam.size(1) >= max_length for beam in current_beams):
-                    # Force end all beams that reached max length
-                    for beam_sequence, beam_score in current_beams:
-                        new_sequence = torch.cat([beam_sequence, 
-                                                torch.tensor([[end_token_id]], device=device)], dim=1)
-                        finished_beams.append((new_sequence, beam_score))
-                    break
-            
-            # Combine finished beams and remaining beams
-            all_beams = finished_beams + current_beams
-            all_beams = sorted(all_beams, key=lambda x: x, reverse=True)[:n_candidates]
-            
-            # Convert token IDs back to strings
-            sentence_translations = []
-            for beam_sequence, _ in all_beams:
-                # Remove start and end tokens and convert to list
-                token_ids = beam_sequence[0, 1:].tolist()  # Remove start token
-                if end_token_id in token_ids:
-                    # Truncate at end token
-                    end_idx = token_ids.index(end_token_id)
-                    token_ids = token_ids[:end_idx]
-                
-                # Convert to string
-                translation = self.tokenizer.decode(token_ids)
-                sentence_translations.append(translation)
-            
-            all_translations.append(sentence_translations)
+            done = done | (next_token.squeeze(-1) == eos_token_id)
+            if done.all():
+                break
 
-        return all_translations
+            current_token = next_token
+
+        self.clear_cache()
+
+        result = torch.cat(generated, dim=1)
+        # Pad to max_len
+        if result.size(1) < max_len:
+            pad = torch.zeros(batch_size, max_len - result.size(1),
+                              dtype=torch.long, device=device)
+            result = torch.cat([result, pad], dim=1)
+        return result[:, :max_len]
+
+    # ------------------------------------------------------------------ #
+    #  Vectorized beam search with KV cache                               #
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def beam_search(self, src, bos_token_id, eos_token_id,
+                    num_beams=5, max_len=None):
+        """
+        Batch-vectorized beam search.
+
+        All beams for all sentences are decoded as a single
+        (batch_size × num_beams, seq) tensor – no Python loops over beams.
+
+        Returns: (batch, ≤max_len) token ids of the best beam per sentence.
+        """
+        if max_len is None:
+            max_len = self.max_len
+
+        self.eval()
+        device = src.device
+        batch_size = src.size(0)
+
+        # 1. Encode source once, then expand for beams
+        encoder_output = self.encode(src)                                    # (B, S, E)
+        cross_mask = self._make_cross_attn_pad_mask(src)                     # (B, H, 1, S)
+        encoder_output = encoder_output.repeat_interleave(num_beams, dim=0)  # (B*beam, S, E)
+        cross_mask = cross_mask.repeat_interleave(num_beams, dim=0)
+
+        # 2. Initialise beams
+        B_beam = batch_size * num_beams
+        current_token = torch.full((B_beam, 1), bos_token_id,
+                                   dtype=torch.long, device=device)
+        beam_scores = torch.zeros(B_beam, device=device)
+        # Deactivate all but the first beam per batch sentence
+        beam_scores.view(batch_size, num_beams)[:, 1:] = -1e9
+
+        done = torch.zeros(B_beam, dtype=torch.bool, device=device)
+        all_tokens = current_token.clone()
+
+        self.clear_cache()
+
+        for step in range(max_len - 1):
+            logits = self.decode(current_token, encoder_output,
+                                 cross_attn_pad_mask=cross_mask, use_cache=True)
+            log_probs = F.log_softmax(logits[:, -1, :], dim=-1)    # (B*beam, V)
+            vocab_size = log_probs.size(-1)
+
+            # Finished beams: force EOS to preserve score, -inf elsewhere
+            log_probs[done] = -1e9
+            log_probs[done, eos_token_id] = 0.0
+
+            # Expand and select top-k across (beam × vocab) per sentence
+            next_scores = beam_scores.unsqueeze(-1) + log_probs            # (B*beam, V)
+            next_scores = next_scores.view(batch_size, num_beams * vocab_size)
+            top_scores, top_indices = next_scores.topk(num_beams, dim=-1)  # (B, beam)
+
+            beam_idx = top_indices // vocab_size    # which old beam
+            token_idx = top_indices % vocab_size    # which token
+
+            # Map to global (flattened) beam indices
+            offsets = torch.arange(batch_size, device=device).unsqueeze(-1) * num_beams
+            global_idx = (offsets + beam_idx).view(-1)
+
+            # Re-order KV caches to match selected beams
+            self._reorder_cache(global_idx)
+
+            beam_scores = top_scores.view(-1)
+            current_token = token_idx.view(-1, 1)
+
+            all_tokens = torch.cat([all_tokens[global_idx], current_token], dim=1)
+            done = done[global_idx] | (current_token.squeeze(-1) == eos_token_id)
+
+            if done.all():
+                break
+
+        self.clear_cache()
+
+        # Pick best beam per sentence
+        best_beam = beam_scores.view(batch_size, num_beams).argmax(dim=-1)
+        batch_idx = torch.arange(batch_size, device=device)
+        best_global = batch_idx * num_beams + best_beam
+
+        result = all_tokens[best_global]
+        if result.size(1) < max_len:
+            pad = torch.zeros(batch_size, max_len - result.size(1),
+                              dtype=torch.long, device=device)
+            result = torch.cat([result, pad], dim=1)
+        return result[:, :max_len]
+
+    def _reorder_cache(self, beam_indices):
+        """Re-order all decoder KV caches to match beam selection."""
+        for decoder in self.decoders:
+            for attn in [decoder.masked_multihead_attention, decoder.multihead_attention]:
+                if attn.k_cache is not None:
+                    attn.k_cache = attn.k_cache[beam_indices]
+                    attn.v_cache = attn.v_cache[beam_indices]
 
         
 

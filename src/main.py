@@ -4,7 +4,7 @@ Trainer Function
     2) Initialize Model
     3) Train
 
-Hyperparameters from the Paper(Attention is all you need):
+Hyperparameters from the Paper (Attention is all you need):
 
 Model Architecture
     Number of encoder layers: 6
@@ -27,14 +27,19 @@ Training
 Other
     Label smoothing: 0.1
     Weight decay: 0.01
+
+Changes vs original:
+    - bf16 model saving via TransformerModel.save_bf16()
+    - tgt_input built on GPU directly (no redundant .to(device))
+    - autocast device_type='cuda' (not 'cuda:0')
+    - sacrebleu for BLEU scoring
+    - Validation limited to N batches (already was ~50)
+    - test_model avg_loss divides by actual count, not len(test)
 '''
 
 import torch
 from tqdm import tqdm
 
-# WandB is used for logging
-# and tracking the training process
-# and results
 import wandb
 from model import TransformerModel
 from transformers import AutoTokenizer
@@ -51,7 +56,7 @@ language = 'de'
 bos_token = {'bos_token': '<s>'}
 tokenizer = AutoTokenizer.from_pretrained("t5-base")
 tokenizer.add_special_tokens(bos_token)
-device_name = 'cuda:2'
+device_name = 'cuda:0'
 
 with open(path / 'logs/sample_generation.log', 'w') as f:
     pass
@@ -60,37 +65,35 @@ logger_main = logging.getLogger(__name__)
 logging.basicConfig(filename=path / 'logs/sample_generation.log', level=logging.DEBUG)
 logger_main.info("logging started")
 
-    
 
 def train_model(model, train, valid, device, vocab_size, run_name, length_data, tokenizer_max_len, epochs=5):
 
     count = 0
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1, betas=(0.9, 0.98), eps=1e-5)
-    
+
     warmup_steps = 4000
-    def lr_lambda(current_step:int):
+    def lr_lambda(current_step: int):
         current_step += 1
         scale = 1024 ** -0.5
         warmup = current_step * (warmup_steps ** -1.5)
         decay = current_step ** -0.5
         wandb.log({'lr': scale * min(warmup, decay)}, step=count)
         return scale * min(warmup, decay)
-    
+
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=lr_lambda)
 
     criterion = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, label_smoothing=0.1)
     criterion_valid = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    
+
     valid_loss = 0
     best_loss = 100000
-    
 
-    scaler = torch.amp.GradScaler(device_name)
+    scaler = torch.amp.GradScaler('cuda')
 
     for epoch in range(epochs):
         print(f'Epoch {epoch+1}/{epochs}')
-        
+
         batches = tqdm(train, dynamic_ncols=False, mininterval=200, miniters=200)
         for batch in batches:
             count += 1
@@ -99,14 +102,14 @@ def train_model(model, train, valid, device, vocab_size, run_name, length_data, 
             src = batch['input_ids'].to(device, non_blocking=True).contiguous()
             tgt = batch['labels'].to(device, non_blocking=True).contiguous()
 
-            tgt_input = torch.zeros_like(tgt).to(device)
-            tgt_input[:, 1:] = tgt[:,:-1]
-            tgt_input[:, 0] = tokenizer.bos_token_id
-            
-            with torch.amp.autocast(device_type=device_name):
+            # Build tgt_input on GPU directly – no redundant zeros_like + .to(device)
+            bos_column = torch.full((tgt.size(0), 1), tokenizer.bos_token_id,
+                                    device=device, dtype=tgt.dtype)
+            tgt_input = torch.cat([bos_column, tgt[:, :-1]], dim=1)
+
+            with torch.amp.autocast(device_type='cuda'):
                 output = model(src, tgt_input)
                 loss = criterion(output.reshape(-1, output.size(-1)), tgt.reshape(-1))
-
 
             wandb.log({"Train Loss": loss}, step=count)
 
@@ -119,20 +122,24 @@ def train_model(model, train, valid, device, vocab_size, run_name, length_data, 
             scaler.update()
             scheduler.step()
 
-            if count % 1000 == 1:
+            if count % 2000 == 1:
 
                 model.eval()
-                
+
                 with torch.no_grad():
-                    output_tf = tokenizer.decode(torch.argmax(model(src, tgt_input), dim=-1)[0], skip_special_tokens=True)
+                    output_tf = tokenizer.decode(
+                        torch.argmax(model(src, tgt_input), dim=-1)[0],
+                        skip_special_tokens=True,
+                    )
                     result = generate(model, src[0].unsqueeze(0), tokenizer, max_len=tokenizer_max_len)
+                    result = tokenizer.batch_decode(result, skip_special_tokens=True)[0]
                     bleu_score = calculate_bleu_score(result, batch['translation']['en'][0])
                     wandb.log({"BLEU Score": bleu_score}, step=count)
-                    result = tokenizer.batch_decode(result, skip_special_tokens=True)[0]
+
                     logger_main.info('')
                     logger_main.info('--------------------------------------------------------')
                     logger_main.info('')
-                    logger_main.info('Epoch {}, Batch {}'.format(epoch+1, count%len(train)))
+                    logger_main.info('Epoch {}, Batch {}'.format(epoch + 1, count % len(train)))
                     logger_main.info('Original Text:')
                     logger_main.info(batch['translation'][language][0])
                     logger_main.info('')
@@ -145,34 +152,37 @@ def train_model(model, train, valid, device, vocab_size, run_name, length_data, 
                     logger_main.info('Generated Text: ')
                     logger_main.info(result)
 
-                # Due to the dropout layer and some reasons, the validation loss can be smaller than the training loss
-                # To show this, turn off the model.eval() and calculate the validation loss with dropout
-
+                # Sampled validation (fixed N batches to avoid stalling training)
+                n_valid_batches = 50
                 total_valid_loss = 0
                 with torch.no_grad():
-                    for valid_batch in valid:
-                        src = valid_batch['input_ids'].to(device, non_blocking=True)
-                        tgt = valid_batch['labels'].to(device, non_blocking=True)
-                        tgt_input = torch.full_like(tgt, 0)
-                        tgt_input[:, 1:] = tgt[:, :-1]
-                        tgt_input[:, 0] = tokenizer.bos_token_id
-                        
-                        with torch.amp.autocast(device_type=device_name):
-                            output = model(src, tgt_input)
+                    for i, valid_batch in enumerate(valid):
+                        if i >= n_valid_batches:
+                            break
+                        v_src = valid_batch['input_ids'].to(device, non_blocking=True)
+                        v_tgt = valid_batch['labels'].to(device, non_blocking=True)
+                        bos_col = torch.full((v_tgt.size(0), 1), tokenizer.bos_token_id,
+                                             device=device, dtype=v_tgt.dtype)
+                        v_tgt_input = torch.cat([bos_col, v_tgt[:, :-1]], dim=1)
+
+                        with torch.amp.autocast(device_type='cuda'):
+                            v_output = model(v_src, v_tgt_input)
                             total_valid_loss += criterion_valid(
-                                output.view(-1, vocab_size),
-                                tgt.view(-1)
+                                v_output.view(-1, vocab_size),
+                                v_tgt.view(-1),
                             ).detach()
-                            
-                valid_loss = total_valid_loss / len(valid)
+
+                valid_loss = total_valid_loss / n_valid_batches
                 wandb.log({"Valid Loss": valid_loss}, step=count)
 
-                # save model if improved
-                if valid_loss < best_loss or count%len(batches) == 0:
-                    torch.save(model.state_dict(), \
-                        path/'models/{}/model-checkpoint-epoch{}-iter{}-{}.mdl'.format(run_name, epoch+1, count-1, length_data))
+                # Save model in bf16 if improved (or at end of epoch)
+                if valid_loss < best_loss or count % len(batches) == 0:
+                    save_path = path / 'models/{}/model-checkpoint-epoch{}-iter{}-{}.mdl'.format(
+                        run_name, epoch + 1, count - 1, length_data,
+                    )
+                    TransformerModel.save_bf16(model, save_path)
                     best_loss = valid_loss
-            
+
             batches.set_description(f"Loss: {loss:.6f} / Valid loss: {valid_loss:.6f}")
 
 
@@ -186,18 +196,19 @@ def test_model(model, test, device, vocab_size):
             count += 1
             src = batch['input_ids'].to(device)
             tgt = batch['labels'].to(device)
-            tgt_input = torch.full_like(tgt, 0)
-            tgt_input[:, 1:] = tgt[:, :-1]
-            tgt_input[:, 0] = tokenizer.bos_token_id
+            bos_column = torch.full((tgt.size(0), 1), tokenizer.bos_token_id,
+                                    device=device, dtype=tgt.dtype)
+            tgt_input = torch.cat([bos_column, tgt[:, :-1]], dim=1)
 
-            output = model(src, tgt_input)
+            with torch.amp.autocast(device_type='cuda'):
+                output = model(src, tgt_input)
             loss = criterion(output.view(-1, vocab_size), tgt.reshape(-1))
 
             total_loss += loss.item()
             if count == 100:
                 break
 
-        avg_loss = total_loss / len(test)
+        avg_loss = total_loss / count
         print(f"Test Loss: {avg_loss:.4f}")
         wandb.log({"Test Loss": avg_loss})
 
@@ -208,20 +219,23 @@ def test():
     # num_heads 16, hidden_layers 4096, train_steps 300k for the same result with the paper
     # Training 300K -> dataset 4.5M (wmt14 en-de)
     embed_dim = 1024
-    num_heads = 16  
+    num_heads = 16
     dropout_rate = 0.1
-    hidden_layer_dim = 1024*3
+    hidden_layer_dim = 1024 * 3
     tokenizer_max_len = 128
     vocab_size = 32129
     stacks = 6
-    batch_size = 64
+    batch_size = 256
     train_on_short_sentences = False
-    len_train = batch_size*50*1000
+    len_train = batch_size * 15 * 1000
     epochs = 5
     run_name = '1024_2048_50k*64'
-    
+
     # Download dataset
-    train, valid, test = download_data(batch_size=batch_size, tokenizer_max_len=tokenizer_max_len, len_train=len_train, short_sentences=train_on_short_sentences)
+    train, valid, test = download_data(
+        batch_size=batch_size, tokenizer_max_len=tokenizer_max_len,
+        len_train=len_train, short_sentences=train_on_short_sentences,
+    )
 
     # Initialize wandb
     wandb.init(project='transformer_from_scratch', name=run_name)
@@ -241,12 +255,18 @@ def test():
     model = model.to(device)
     print(device)
 
-    # Load model
-    # model.load_state_dict(torch.load(path/'models/{}/model-checkpoint-epoch2-iter172000-short.mdl'.format(run_name), map_location=device, weights_only=True))
+    # To load an existing checkpoint (bf16 or fp32):
+    # TransformerModel.load_bf16(model, path/'models/.../checkpoint.mdl', device=device)
+    # or for old fp32 checkpoints:
+    # model.load_state_dict(torch.load(path/'models/.../checkpoint.mdl', map_location=device, weights_only=True), strict=False)
 
     # Train
-    train_model(model, train, valid, device, vocab_size, epochs=epochs, run_name=run_name, tokenizer_max_len=tokenizer_max_len, length_data='short' if train_on_short_sentences else 'long')
-    
+    train_model(
+        model, train, valid, device, vocab_size,
+        epochs=epochs, run_name=run_name, tokenizer_max_len=tokenizer_max_len,
+        length_data='short' if train_on_short_sentences else 'long',
+    )
+
     # Test
     test_model(model, test, device, vocab_size)
 

@@ -1,0 +1,6 @@
+logs
+data
+models
+*.out
+__pycache__/
+wandb/

@@ -30,15 +30,15 @@ def download_data(batch_size, tokenizer_max_len, len_train, short_sentences, tes
 
         if short_sentences:
             # Short, but not too short...
-            short_sentences_train = train_dataset.filter(lambda example: len(example["translation"]["en"].split()) <= 16 and len(example["translation"]["en"].split()) > 8)
+            short_sentences_train = train_dataset.filter(lambda example: len(example["translation"]["en"].split()) <= 12 and len(example["translation"]["en"].split()) > 8)
             short_sentences_train = short_sentences_train.shuffle(seed=42)
-            short_sentences_test = test_dataset.filter(lambda example: len(example["translation"]["en"].split()) <= 16 and len(example["translation"]["en"].split()) > 8)
+            short_sentences_test = test_dataset.filter(lambda example: len(example["translation"]["en"].split()) <= 12 and len(example["translation"]["en"].split()) > 8)
             train_dataset = short_sentences_train
             test_dataset = short_sentences_test
         else:
-            long_sentences_train = train_dataset.filter(lambda example: len(example["translation"]["en"].split()) > 16)
+            long_sentences_train = train_dataset.filter(lambda example: len(example["translation"]["en"].split()) > 12)
             long_sentences_train = long_sentences_train.shuffle(seed=42)
-            long_sentences_test = test_dataset.filter(lambda example: len(example["translation"]["en"].split()) > 16)
+            long_sentences_test = test_dataset.filter(lambda example: len(example["translation"]["en"].split()) > 12)
             train_dataset = long_sentences_train
             test_dataset = long_sentences_test
 
@@ -88,7 +88,7 @@ def download_data(batch_size, tokenizer_max_len, len_train, short_sentences, tes
 
     test_split = test.train_test_split(test_size=test_ratio, seed=42)
 
-    train = train.select(range(len_train, len_train*2))
+    train = train.select(range(len_train))
     train = train.with_format(type='torch')
     valid = test_split['train'].with_format(type='torch')
     test = test_split['test'].with_format(type='torch')
@@ -110,8 +110,8 @@ def download_data(batch_size, tokenizer_max_len, len_train, short_sentences, tes
     test = test.sort('first_one_position')
     test = test.remove_columns(['first_one_position'])
 
-    train = DataLoader(train, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
-    valid = DataLoader(valid, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
-    test = DataLoader(test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
+    train = DataLoader(train, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=8)
+    valid = DataLoader(valid, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=8)
+    test = DataLoader(test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=8)
 
     return train, valid, test
