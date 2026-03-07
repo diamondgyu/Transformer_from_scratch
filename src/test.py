@@ -2,15 +2,14 @@ import torch
 from transformers import AutoTokenizer
 from model import TransformerModel
 from tqdm import tqdm
-from downloader import download_data
+from process_korean_data import download_data
 import sacrebleu
 import pathlib
 
-device_name = 'cuda:0'
+device_name = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-bos_token = {'bos_token': '<s>'}
-tokenizer = AutoTokenizer.from_pretrained("t5-base")
-tokenizer.add_special_tokens(bos_token)
+# bos_token = {'bos_token': '<s>'}
+# tokenizer.add_special_tokens(bos_token)
 
 
 def generate(model, input_text, tokenizer, max_len):
@@ -31,7 +30,7 @@ def generate(model, input_text, tokenizer, max_len):
             encoded['input_ids'], dtype=torch.long, device=device,
         ).unsqueeze(0)
 
-    return model.greedy_generate(
+    return model.beam_generate(
         src=input_text,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -123,7 +122,7 @@ if __name__ == "__main__":
     # Batch evaluation with corpus-level BLEU (sacrebleu)
     _, valid, test_data = download_data(
         batch_size=32, tokenizer_max_len=128, len_train=1,
-        short_sentences=False, test_ratio=0.99,
+        test_ratio=0.99,
     )
 
     all_generated = []

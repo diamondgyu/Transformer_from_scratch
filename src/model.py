@@ -1,25 +1,10 @@
 '''
-Transformer Model from Scratch (only using Linear & Dropout)
+Transformer Model from Scratch (only using Linear, Dropout)
 
 Architecture:
     1. Encoder: pre-norm self-attention + feedforward (× N stacks)
     2. Decoder: pre-norm masked self-attn + cross-attn + feedforward (× N stacks)
     3. TransformerModel: encode → decode pipeline
-
-Optimizations over original:
-    - Separate encode()/decode() so the encoder runs once during inference
-    - KV cache for autoregressive generation (decoder self-attn & cross-attn)
-    - register_buffer for positional encoding & causal mask (auto .to(device))
-    - Fixed attention scaling: sqrt(head_dim) instead of sqrt(embed_dim)
-    - Each sub-layer uses its own dedicated LayerNorm
-    - Dropout applied to attention weights (per the paper)
-    - bf16 save/load utilities
-    - Vectorized beam search (all beams batched as a single tensor)
-
-NOTE: The attention scaling fix (head_dim vs embed_dim) and layer-norm fix
-      change model behaviour. Existing checkpoints trained with the old code
-      will produce different results. Use strict=False when loading old
-      checkpoints (new register_buffer keys won't exist in old state_dicts).
 '''
 
 import torch
@@ -27,19 +12,8 @@ from torch.nn import Module, ModuleList, Linear, ReLU, Dropout, LayerNorm, Seque
 import torch.nn.functional as F
 import math
 
-
-# --------------------------------------------------------------------------- #
-#  Multi-Head Attention with KV Cache                                         #
-# --------------------------------------------------------------------------- #
+# Multi-Head Attention from Scratch (with caching)
 class MultiheadAttentionCustom(Module):
-    """
-    Multi-head scaled dot-product attention.
-
-    Supports two caching modes controlled by ``use_cache`` / ``is_cross_attn``:
-      • Self-attention cache  – new K,V are appended to the cache each step.
-      • Cross-attention cache – K,V are computed once from encoder output and
-                                 reused on every subsequent step.
-    """
 
     def __init__(self, embed_dim: int, num_heads: int, dropout: float):
         super().__init__()
@@ -52,6 +26,8 @@ class MultiheadAttentionCustom(Module):
         self.Q = Linear(embed_dim, embed_dim, bias=False)
         self.K = Linear(embed_dim, embed_dim, bias=False)
         self.V = Linear(embed_dim, embed_dim, bias=False)
+
+        self.out_proj = Linear(embed_dim, embed_dim, bias=True)
 
         self.attn_dropout = Dropout(p=dropout)
 
@@ -67,24 +43,22 @@ class MultiheadAttentionCustom(Module):
                 use_cache=False, is_cross_attn=False):
         batch_size = query.size(0)
 
-        # Project query → (batch, heads, seq_q, head_dim)
         Q = self.Q(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # ---------- K, V with optional caching ----------
+        # KV caching logic
         if use_cache:
             if is_cross_attn and self.k_cache is not None:
-                # Cross-attention: encoder K,V never change → reuse cache
+                # reuse cache
                 K, V = self.k_cache, self.v_cache
             else:
                 K_new = self.K(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
                 V_new = self.V(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
                 if not is_cross_attn and self.k_cache is not None:
-                    # Self-attention: append new token's K,V to history
+                    # Self-attention: append new token's K,V
                     K = torch.cat([self.k_cache, K_new], dim=2)
                     V = torch.cat([self.v_cache, V_new], dim=2)
                 else:
-                    # First step (or cross-attention first call): initialise cache
                     K, V = K_new, V_new
 
                 self.k_cache = K
@@ -94,7 +68,7 @@ class MultiheadAttentionCustom(Module):
             K = self.K(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
             V = self.V(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention  (paper: scale by √d_k , d_k = head_dim)
+        # Scaled dot-product attention
         scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.head_dim)
 
         if attn_mask is not None:
@@ -106,14 +80,12 @@ class MultiheadAttentionCustom(Module):
         attn_weights = self.attn_dropout(attn_weights)
 
         context = torch.matmul(attn_weights, V)
-        # Concatenate heads → (batch, seq, embed_dim)
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
-        return context
+        return self.out_proj(context)
 
 
-# --------------------------------------------------------------------------- #
-#  Encoder Layer                                                              #
-# --------------------------------------------------------------------------- #
+#  Encoder Layer                                                              
+
 class Encoder(Module):
     def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, hidden_layer_dim: int):
         super().__init__()
@@ -216,7 +188,7 @@ class TransformerModel(Module):
     """
 
     def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float,
-                 hidden_layer_dim: int, max_len: int, vocab_size: int, stacks: int):
+                 hidden_layer_dim: int, max_len: int, vocab_size: int, stacks: int, pad_token_id: int):
         super().__init__()
 
         self.max_len = max_len
@@ -227,9 +199,11 @@ class TransformerModel(Module):
         self.vocab_size = vocab_size
         self.embed_scale = math.sqrt(embed_dim)
 
+        self.pad_token_id = pad_token_id
+
         # Embedding layers
         self.token_embedding = Embedding(vocab_size, embed_dim)
-        self.token_embedding_dec = Embedding(vocab_size, embed_dim)
+        self.token_embedding_dec = self.token_embedding  # Share source and target token embeddings (optional)
 
         # Encoder / Decoder stacks
         self.encoders = ModuleList([
@@ -241,7 +215,6 @@ class TransformerModel(Module):
             for _ in range(stacks)
         ])
 
-        # Fixed tensors → register_buffer (move with model, saved in state_dict)
         self.register_buffer(
             'positional_encoding',
             self._generate_positional_encoding(max_len, embed_dim),
@@ -254,14 +227,13 @@ class TransformerModel(Module):
         # Output head
         self.final_layer_norm = LayerNorm(embed_dim)
         self.output_layer = Linear(embed_dim, vocab_size, bias=True)
+        self.output_layer.weight = self.token_embedding.weight
 
         # Decode-position tracker for KV cache (not saved in state_dict)
         self._decode_pos = 0
 
-    # ------------------------------------------------------------------ #
-    #  Positional encoding                                                #
-    # ------------------------------------------------------------------ #
-    @staticmethod
+    #  Positional encoding          
+    @staticmethod              
     def _generate_positional_encoding(max_len, embed_dim):
         pe = torch.zeros(max_len, embed_dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -272,29 +244,22 @@ class TransformerModel(Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)  # (1, max_len, embed_dim)
 
-    # ------------------------------------------------------------------ #
-    #  Mask helpers                                                       #
-    # ------------------------------------------------------------------ #
+    #  Mask helpers
     def _make_src_pad_mask(self, src):
-        """2D pad mask for encoder self-attention: (B, H, S, S)."""
-        mask = (src != 0)  # (B, S)
+        mask = (src != self.pad_token_id)  # (B, S)
         col_mask = mask.unsqueeze(1).unsqueeze(2)   # (B, 1, 1, S)
         row_mask = mask.unsqueeze(1).unsqueeze(3)   # (B, 1, S, 1)
         return (col_mask & row_mask).expand(-1, self.num_heads, -1, -1)
-
+    
     def _make_tgt_pad_mask(self, tgt):
-        """Key-side pad mask for decoder self-attention: (B, H, 1, T)."""
-        mask = (tgt != 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+        mask = (tgt != self.pad_token_id).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
         return mask.expand(-1, self.num_heads, -1, -1)
-
+    
     def _make_cross_attn_pad_mask(self, src):
-        """Source key-side pad mask for cross-attention: (B, H, 1, S)."""
-        mask = (src != 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
+        mask = (src != self.pad_token_id).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
         return mask.expand(-1, self.num_heads, -1, -1)
 
-    # ------------------------------------------------------------------ #
-    #  Encode / Decode  (separable for efficient inference)               #
-    # ------------------------------------------------------------------ #
+    #  Encode / Decode  (separable for reusable source encoding during inference)
     def encode(self, src):
         """Encode source tokens → encoder hidden states (B, S, E)."""
         pad_mask = self._make_src_pad_mask(src)
@@ -306,12 +271,6 @@ class TransformerModel(Module):
 
     def decode(self, tgt, encoder_output, tgt_pad_mask=None,
                cross_attn_pad_mask=None, use_cache=False):
-        """
-        Decode target tokens given encoder output.
-
-        Training  → full tgt sequence, use_cache=False
-        Inference → single new token per step, use_cache=True
-        """
         seq_len = tgt.size(1)
         x = self.token_embedding_dec(tgt) * self.embed_scale
 
@@ -322,7 +281,7 @@ class TransformerModel(Module):
         else:
             x = x + self.positional_encoding[:, :seq_len]
 
-        # Causal mask: unnecessary when using KV cache with a single token
+        # Causal mask
         target_mask = (
             None if (use_cache and seq_len == 1)
             else self.causal_mask[:seq_len, :seq_len]
@@ -339,14 +298,11 @@ class TransformerModel(Module):
         return self.output_layer(x)
 
     def clear_cache(self):
-        """Reset all decoder KV caches and decode position counter."""
         for decoder in self.decoders:
             decoder.clear_cache()
         self._decode_pos = 0
 
-    # ------------------------------------------------------------------ #
-    #  Combined forward  (training)                                       #
-    # ------------------------------------------------------------------ #
+    #  Combined forward  (training)
     def forward(self, src, tgt):
         """Full forward pass for teacher-forced training (no caching)."""
         tgt_pad_mask = self._make_tgt_pad_mask(tgt)
@@ -360,9 +316,7 @@ class TransformerModel(Module):
             use_cache=False,
         )
 
-    # ------------------------------------------------------------------ #
-    #  bf16 save / load                                                   #
-    # ------------------------------------------------------------------ #
+    #  bf16 save / load
     @staticmethod
     def save_bf16(model, path):
         """Save model checkpoint in bfloat16 (≈50 % smaller file)."""
@@ -383,9 +337,7 @@ class TransformerModel(Module):
         model.load_state_dict(state_dict, strict=False)
         return model
 
-    # ------------------------------------------------------------------ #
-    #  Greedy generation with KV cache                                    #
-    # ------------------------------------------------------------------ #
+    #  Greedy generation with KV cache
     @torch.no_grad()
     def greedy_generate(self, src, bos_token_id, eos_token_id, max_len=None):
         """
@@ -400,11 +352,9 @@ class TransformerModel(Module):
         device = src.device
         batch_size = src.size(0)
 
-        # Encode source ONCE
         encoder_output = self.encode(src)
         cross_mask = self._make_cross_attn_pad_mask(src)
 
-        # Initialise with BOS
         current_token = torch.full((batch_size, 1), bos_token_id,
                                    dtype=torch.long, device=device)
         generated = [current_token]
@@ -417,7 +367,7 @@ class TransformerModel(Module):
                                  cross_attn_pad_mask=cross_mask, use_cache=True)
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
-            # Pad finished sequences with 0
+            # Pad sequences with 0
             next_token = next_token.masked_fill(done.unsqueeze(-1), 0)
             generated.append(next_token)
 
@@ -437,18 +387,13 @@ class TransformerModel(Module):
             result = torch.cat([result, pad], dim=1)
         return result[:, :max_len]
 
-    # ------------------------------------------------------------------ #
-    #  Vectorized beam search with KV cache                               #
-    # ------------------------------------------------------------------ #
+    # Vectorized beam search with Length Penalty & KV cache
+    # Vibe-Coded
     @torch.no_grad()
-    def beam_search(self, src, bos_token_id, eos_token_id,
-                    num_beams=5, max_len=None):
+    def beam_generate(self, src, bos_token_id, eos_token_id,
+                      num_beams=5, max_len=None, length_penalty=1.0):
         """
-        Batch-vectorized beam search.
-
-        All beams for all sentences are decoded as a single
-        (batch_size × num_beams, seq) tensor – no Python loops over beams.
-
+        Batch-vectorized beam search with Length Penalty.
         Returns: (batch, ≤max_len) token ids of the best beam per sentence.
         """
         if max_len is None:
@@ -459,21 +404,25 @@ class TransformerModel(Module):
         batch_size = src.size(0)
 
         # 1. Encode source once, then expand for beams
-        encoder_output = self.encode(src)                                    # (B, S, E)
-        cross_mask = self._make_cross_attn_pad_mask(src)                     # (B, H, 1, S)
-        encoder_output = encoder_output.repeat_interleave(num_beams, dim=0)  # (B*beam, S, E)
+        encoder_output = self.encode(src) # (B, S, E)
+        cross_mask = self._make_cross_attn_pad_mask(src) # (B, H, 1, S)
+        encoder_output = encoder_output.repeat_interleave(num_beams, dim=0) # (B*beam, S, E)
         cross_mask = cross_mask.repeat_interleave(num_beams, dim=0)
 
         # 2. Initialise beams
         B_beam = batch_size * num_beams
         current_token = torch.full((B_beam, 1), bos_token_id,
                                    dtype=torch.long, device=device)
+        
         beam_scores = torch.zeros(B_beam, device=device)
-        # Deactivate all but the first beam per batch sentence
+        # Deactivate all but the first beam per batch sentence to prevent duplicates
         beam_scores.view(batch_size, num_beams)[:, 1:] = -1e9
 
         done = torch.zeros(B_beam, dtype=torch.bool, device=device)
         all_tokens = current_token.clone()
+        
+        # 실제 생성된 길이를 추적 (Length Penalty 계산용)
+        beam_lengths = torch.ones(B_beam, dtype=torch.long, device=device)
 
         self.clear_cache()
 
@@ -506,27 +455,37 @@ class TransformerModel(Module):
             current_token = token_idx.view(-1, 1)
 
             all_tokens = torch.cat([all_tokens[global_idx], current_token], dim=1)
-            done = done[global_idx] | (current_token.squeeze(-1) == eos_token_id)
+            
+            was_done = done[global_idx]
+            is_eos = (current_token.squeeze(-1) == eos_token_id)
+            done = was_done | is_eos
+            
+            beam_lengths = beam_lengths[global_idx]
+            beam_lengths[~was_done] += 1
 
             if done.all():
                 break
 
         self.clear_cache()
 
+        # Length Penalty
+        penalized_scores = beam_scores / (beam_lengths.float() ** length_penalty)
+        
         # Pick best beam per sentence
-        best_beam = beam_scores.view(batch_size, num_beams).argmax(dim=-1)
+        best_beam = penalized_scores.view(batch_size, num_beams).argmax(dim=-1)
         batch_idx = torch.arange(batch_size, device=device)
         best_global = batch_idx * num_beams + best_beam
 
         result = all_tokens[best_global]
+        
         if result.size(1) < max_len:
-            pad = torch.zeros(batch_size, max_len - result.size(1),
-                              dtype=torch.long, device=device)
+            pad = torch.full((batch_size, max_len - result.size(1)), self.pad_token_id,
+                             dtype=torch.long, device=device)
             result = torch.cat([result, pad], dim=1)
+            
         return result[:, :max_len]
 
     def _reorder_cache(self, beam_indices):
-        """Re-order all decoder KV caches to match beam selection."""
         for decoder in self.decoders:
             for attn in [decoder.masked_multihead_attention, decoder.multihead_attention]:
                 if attn.k_cache is not None:

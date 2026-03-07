@@ -1,6 +1,8 @@
-logs
-data
-models
+logs/*
+data/*.xlsx
+data/*.json
+models/*
+.vscode/
 *.out
 __pycache__/
 wandb/
