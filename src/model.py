@@ -45,7 +45,9 @@ class MultiheadAttentionCustom(Module):
 
         Q = self.Q(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # KV caching logic
+        # KV calculation
+        # IMPORTANT: transpose -> view -> transpose!!!!!!
+        # The dimensions will be the same but the alignments will be broken otherwise
         if use_cache:
             if is_cross_attn and self.k_cache is not None:
                 # reuse cache
@@ -337,14 +339,10 @@ class TransformerModel(Module):
         model.load_state_dict(state_dict, strict=False)
         return model
 
-    #  Greedy generation with KV cache
+    #  Greedy generation with reusable encoding
     @torch.no_grad()
     def greedy_generate(self, src, bos_token_id, eos_token_id, max_len=None):
-        """
-        Fast greedy decoding: encode once → decode token-by-token with KV cache.
 
-        Returns: (batch, ≤max_len) token ids including BOS, padded with 0.
-        """
         if max_len is None:
             max_len = self.max_len
 
@@ -363,28 +361,26 @@ class TransformerModel(Module):
         self.clear_cache()
 
         for _ in range(max_len - 1):
+
             logits = self.decode(current_token, encoder_output,
                                  cross_attn_pad_mask=cross_mask, use_cache=True)
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-
-            # Pad sequences with 0
             next_token = next_token.masked_fill(done.unsqueeze(-1), 0)
             generated.append(next_token)
-
             done = done | (next_token.squeeze(-1) == eos_token_id)
+
             if done.all():
                 break
 
             current_token = next_token
 
-        self.clear_cache()
-
         result = torch.cat(generated, dim=1)
-        # Pad to max_len
+
         if result.size(1) < max_len:
             pad = torch.zeros(batch_size, max_len - result.size(1),
                               dtype=torch.long, device=device)
             result = torch.cat([result, pad], dim=1)
+
         return result[:, :max_len]
 
     # Vectorized beam search with Length Penalty & KV cache
@@ -430,6 +426,13 @@ class TransformerModel(Module):
             logits = self.decode(current_token, encoder_output,
                                  cross_attn_pad_mask=cross_mask, use_cache=True)
             log_probs = F.log_softmax(logits[:, -1, :], dim=-1)    # (B*beam, V)
+            
+            repetition_penalty = 1.2
+            if repetition_penalty != 1.0:
+                prev_token_log_probs = torch.gather(log_probs, 1, all_tokens)
+                penalized_log_probs = prev_token_log_probs * repetition_penalty
+                log_probs.scatter_(1, all_tokens, penalized_log_probs)
+            
             vocab_size = log_probs.size(-1)
 
             # Finished beams: force EOS to preserve score, -inf elsewhere
@@ -491,7 +494,3 @@ class TransformerModel(Module):
                 if attn.k_cache is not None:
                     attn.k_cache = attn.k_cache[beam_indices]
                     attn.v_cache = attn.v_cache[beam_indices]
-
-        
-
-    

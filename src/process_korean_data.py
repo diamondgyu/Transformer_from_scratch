@@ -23,7 +23,6 @@ def convert_xlsx_to_json():
     for file in xlsx_files:
         print(f"Processing {file.name}...")
         df = pd.read_excel(file)
-        # Use '원문' for Korean and '번역문' for English as identified
         if '원문' in df.columns and '번역문' in df.columns:
             for _, row in df.iterrows():
                 all_data.append({

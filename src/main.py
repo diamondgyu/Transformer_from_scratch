@@ -263,11 +263,9 @@ def test():
     model = model.to(device)
     print(device)
 
-    # To load an existing checkpoint (bf16 or fp32):
-    # TransformerModel.load_bf16(model, path/'models/.../checkpoint.mdl', device=device)
-    # or for old fp32 checkpoints:
-    # model.load_state_dict(torch.load(path/'models/.../checkpoint.mdl', map_location=device, weights_only=True), strict=False)
-
+    # To load an existing checkpoint
+    # TransformerModel.load_bf16(model, 'models/.../checkpoint.mdl', device=device)
+    
     # Train
     train_model(
         model, train, valid, device, vocab_size,

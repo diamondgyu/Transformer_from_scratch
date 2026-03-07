@@ -1,3 +1,8 @@
+1. 
 https://aihub.or.kr/aihubdata/data/view.do?currMenu=115&topMenu=100&aihubDataSe=data&dataSetSn=126
 
 put all .xlsx files in the link into this folder
+
+2.
+https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71265
+put TL1 -> 일상생활및구어체_영한_train_set.json here
