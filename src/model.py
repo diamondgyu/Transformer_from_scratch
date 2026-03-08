@@ -184,7 +184,8 @@ class MultiheadAttentionCustom(Module):
 
         q_len = query.size(1)
         Q = self.Q(query).view(batch_size, q_len, self.num_heads, self.head_dim)
-        Q = self._apply_rope(Q, query_position_ids)
+        if not is_cross_attn:
+            Q = self._apply_rope(Q, query_position_ids)
         Q = Q.transpose(1, 2)
 
         # KV calculation (stored in KV-head space for cache efficiency)
@@ -195,7 +196,8 @@ class MultiheadAttentionCustom(Module):
                 kv_len = key.size(1)
                 K_new = self.K(key).view(batch_size, kv_len, self.num_kv_heads, self.head_dim)
                 V_new = self.V(value).view(batch_size, kv_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-                K_new = self._apply_rope(K_new, key_position_ids)
+                if not is_cross_attn:
+                    K_new = self._apply_rope(K_new, key_position_ids)
                 K_new = K_new.transpose(1, 2)
 
                 if not is_cross_attn and self.k_cache is not None:
@@ -210,7 +212,8 @@ class MultiheadAttentionCustom(Module):
             kv_len = key.size(1)
             K_kv = self.K(key).view(batch_size, kv_len, self.num_kv_heads, self.head_dim)
             V_kv = self.V(value).view(batch_size, kv_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            K_kv = self._apply_rope(K_kv, key_position_ids)
+            if not is_cross_attn:
+                K_kv = self._apply_rope(K_kv, key_position_ids)
             K_kv = K_kv.transpose(1, 2)
 
         K = self._expand_kv(K_kv)
@@ -248,7 +251,7 @@ class Encoder(Module):
             max_len=max_len,
             rope_base=rope_base,
         )
-        self.feedforward = FeedForward(embed_dim, hidden_layer_dim, dropout_rate)
+        self.feedforward = SwiGLU(embed_dim, hidden_layer_dim, dropout_rate)
 
         # Each sub-layer gets its own RMSNorm (pre-norm style)
         self.layer_norm_attn = RMSNorm(embed_dim)
@@ -295,7 +298,7 @@ class Decoder(Module):
             max_len=max_len,
             rope_base=rope_base,
         )
-        self.feedforward = FeedForward(embed_dim, hidden_layer_dim, dropout_rate)
+        self.feedforward = SwiGLU(embed_dim, hidden_layer_dim, dropout_rate)
 
         # Dedicated RMSNorm per sub-layer
         self.layer_norm_mask_attn = RMSNorm(embed_dim)
@@ -320,11 +323,12 @@ class Decoder(Module):
         x = x + masked_attn_out
 
         # 2. Pre-norm cross-attention + residual
+        if cross_attn_pad_mask is None:
+            raise ValueError("cross_attn_pad_mask must be provided for cross-attention.")
         normed = self.layer_norm_attn(x)
-        cross_mask = cross_attn_pad_mask if cross_attn_pad_mask is not None else pad_mask
         attn_out = self.multihead_attention(
             query=normed, key=encoder_output, value=encoder_output,
-            pad_mask=cross_mask, use_cache=use_cache, is_cross_attn=True,
+            pad_mask=cross_attn_pad_mask, use_cache=use_cache, is_cross_attn=True,
             query_position_ids=tgt_position_ids,
             key_position_ids=src_position_ids,
         )
@@ -521,7 +525,7 @@ class TransformerModel(Module):
             logits = self.decode(current_token, encoder_output,
                                  cross_attn_pad_mask=cross_mask, use_cache=True)
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            next_token = next_token.masked_fill(done.unsqueeze(-1), 0)
+            next_token = next_token.masked_fill(done.unsqueeze(-1), self.pad_token_id)
             generated.append(next_token)
             done = done | (next_token.squeeze(-1) == eos_token_id)
 
@@ -533,8 +537,8 @@ class TransformerModel(Module):
         result = torch.cat(generated, dim=1)
 
         if result.size(1) < max_len:
-            pad = torch.zeros(batch_size, max_len - result.size(1),
-                              dtype=torch.long, device=device)
+            pad = torch.full((batch_size, max_len - result.size(1)), self.pad_token_id,
+                             dtype=torch.long, device=device)
             result = torch.cat([result, pad], dim=1)
 
         return result[:, :max_len]
@@ -552,6 +556,9 @@ class TransformerModel(Module):
         if self.tokenizer is None:
             raise ValueError("tokenizer is required for beam_generate.")
 
+        if max_len is None:
+            max_len = self.max_len
+
         if isinstance(src, str):
             encoded = self.tokenizer(src, padding='max_length',
                                 truncation=True, max_length=max_len)
@@ -559,14 +566,20 @@ class TransformerModel(Module):
                 encoded['input_ids'], dtype=torch.long, device=self.token_embedding.weight.device,
             ).unsqueeze(0)
 
-        if max_len is None:
-            max_len = self.max_len
-
         self.eval()
         device = self.token_embedding.weight.device
         batch_size = src.size(0)
         bos_token_id = self.tokenizer.bos_token_id
         eos_token_id = self.tokenizer.eos_token_id
+        special_token_ids = {
+            t for t in [
+                self.pad_token_id,
+                self.tokenizer.bos_token_id,
+                self.tokenizer.eos_token_id,
+                self.tokenizer.cls_token_id,
+                self.tokenizer.sep_token_id,
+            ] if t is not None
+        }
 
         # 1. Encode source once, then expand for beams
         encoder_output = self.encode(src) # (B, S, E)
@@ -599,6 +612,11 @@ class TransformerModel(Module):
             if repetition_penalty != 1.0:
                 prev_token_log_probs = torch.gather(log_probs, 1, all_tokens)
                 penalized_log_probs = prev_token_log_probs * repetition_penalty
+                if special_token_ids:
+                    special_mask = torch.zeros_like(all_tokens, dtype=torch.bool)
+                    for token_id in special_token_ids:
+                        special_mask |= (all_tokens == token_id)
+                    penalized_log_probs = torch.where(special_mask, prev_token_log_probs, penalized_log_probs)
                 log_probs.scatter_(1, all_tokens, penalized_log_probs)
             
             vocab_size = log_probs.size(-1)

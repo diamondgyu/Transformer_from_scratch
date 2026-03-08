@@ -66,7 +66,7 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
 
     count = 0
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1, betas=(0.9, 0.98), eps=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1, betas=(0.9, 0.95), eps=1e-5, weight_decay=0.05)
 
     warmup_steps = 8000
     def lr_lambda(current_step: int):
@@ -74,7 +74,6 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
         scale = 0.4 * 512 ** -0.5
         warmup = current_step * (warmup_steps ** -1.5)
         decay = current_step ** -0.5
-        wandb.log({'lr': scale * min(warmup, decay)}, step=count)
         return scale * min(warmup, decay)
 
     scheduler = LambdaLR(optimizer=optimizer, lr_lambda=lr_lambda)
@@ -86,6 +85,12 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
     best_loss = 100000
 
     scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+
+    # Prepare a fixed random set of validation samples once, and reuse every eval step.
+    n_total_valid = len(valid.dataset)
+    n_fixed_valid = min(50, n_total_valid)
+    sample_indices = torch.randperm(n_total_valid)[:n_fixed_valid].tolist() if n_fixed_valid > 0 else []
+    fixed_valid_samples = [valid.dataset[i] for i in sample_indices]
 
     for epoch in range(epochs):
         print(f'Epoch {epoch+1}/{epochs}')
@@ -124,55 +129,37 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
                 
                 optimizer.step()
                 scheduler.step()
+
+            if count % 50 == 0:
+                wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=count)
             
-            if count % 1000 == 1:
+            if count % 1000 == 0:
 
                 model.eval()
 
-                # Sampled validation (fixed N batches to avoid stalling training)
-                n_valid_batches = 50
-                total_valid_loss = 0
-                bleu_src_samples = []
-                bleu_ref_samples = []
-                bleu_ko_samples = []
-                valid_batches_seen = 0
-                with torch.no_grad():
-                    for i, valid_batch in enumerate(valid):
-                        if i >= n_valid_batches:
-                            break
-                        valid_batches_seen += 1
+                if fixed_valid_samples:
+                    fixed_src = torch.stack([item['input_ids'] for item in fixed_valid_samples]).to(device, non_blocking=True)
+                    fixed_tgt = torch.stack([item['labels'] for item in fixed_valid_samples]).to(device, non_blocking=True)
+                    bos_col = torch.full((fixed_tgt.size(0), 1), tokenizer.bos_token_id,
+                                         device=device, dtype=fixed_tgt.dtype)
+                    fixed_tgt_input = torch.cat([bos_col, fixed_tgt[:, :-1]], dim=1)
 
-                        v_src = valid_batch['input_ids'].to(device, non_blocking=True)
-                        v_tgt = valid_batch['labels'].to(device, non_blocking=True)
-                        bos_col = torch.full((v_tgt.size(0), 1), tokenizer.bos_token_id,
-                                             device=device, dtype=v_tgt.dtype)
-                        v_tgt_input = torch.cat([bos_col, v_tgt[:, :-1]], dim=1)
-
+                    with torch.no_grad():
                         use_amp = torch.cuda.is_available()
                         with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp, dtype=torch.bfloat16):
-                            v_output = model(v_src, v_tgt_input)
-                            total_valid_loss += criterion_valid(
-                                v_output.view(-1, vocab_size),
-                                v_tgt.view(-1),
+                            fixed_output = model(fixed_src, fixed_tgt_input)
+                            valid_loss = criterion_valid(
+                                fixed_output.view(-1, vocab_size),
+                                fixed_tgt.view(-1),
                             ).item()
 
-                        # Collect one random source/reference from each validation batch
-                        sample_idx = torch.randint(0, valid_batch['input_ids'].size(0), (1,)).item()
-                        bleu_src_samples.append(valid_batch['input_ids'][sample_idx])
-                        bleu_ref_samples.append(valid_batch['translation']['en'][sample_idx])
-                        bleu_ko_samples.append(valid_batch['translation'][language][sample_idx])
+                    wandb.log({"Valid Loss": valid_loss}, step=count)
 
-                valid_loss = total_valid_loss / max(valid_batches_seen, 1)
-                wandb.log({"Valid Loss": valid_loss}, step=count)
-
-                # BLEU from 50 validation sources (1 random sample from each of 50 validation batches)
-                if bleu_src_samples:
-                    sample_count = len(bleu_src_samples)
-                    sampled_src = torch.stack(bleu_src_samples).to(device, non_blocking=True)
-
-                    generated_ids = model.beam_generate(sampled_src, max_len=tokenizer_max_len)
+                    generated_ids = model.beam_generate(fixed_src, max_len=tokenizer_max_len)
                     generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
+                    bleu_ref_samples = [item['translation']['en'] for item in fixed_valid_samples]
+                    bleu_ko_samples = [item['translation'][language] for item in fixed_valid_samples]
                     bleu_scores = [
                         calculate_bleu_score(pred, ref)
                         for pred, ref in zip(generated_texts, bleu_ref_samples)
@@ -184,9 +171,9 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
                     logger_main.info('--------------------------------------------------------')
                     logger_main.info('')
                     logger_main.info('Epoch {}, Batch {}'.format(epoch + 1, count % len(train)))
-                    logger_main.info('Validation Sample BLEU (n={}): {:.4f}'.format(sample_count, avg_bleu))
+                    logger_main.info('Fixed Validation Sample BLEU (n={}): {:.4f}'.format(len(fixed_valid_samples), avg_bleu))
 
-                    for j in range(sample_count):
+                    for j in range(len(fixed_valid_samples)):
                         logger_main.info('')
                         logger_main.info('[Sample {}]'.format(j + 1))
                         logger_main.info('Original Text:')
@@ -200,7 +187,7 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
                 # Save model in bf16 if improved (or at end of epoch)
                 if valid_loss < best_loss or count % len(batches) == 0:
                     save_path = path / 'models/{}/model-checkpoint-epoch{}-iter{}-{}.mdl'.format(
-                        run_name, epoch + 1, count - 1, 'all',
+                        run_name, epoch + 1, count, 'all',
                     )
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     TransformerModel.save_bf16(model, save_path)
@@ -245,7 +232,7 @@ def test():
     embed_dim = 512
     num_heads = 16
     dropout_rate = 0.1
-    hidden_layer_dim = 2048
+    hidden_layer_dim = 1362
     tokenizer_max_len = 128
     vocab_size = len(tokenizer)
     stacks = 8
@@ -281,7 +268,7 @@ def test():
     print(device)
 
     # To load an existing checkpoint
-    # TransformerModel.load_bf16(model, 'C:/Users/diamo/projects/Transformer_from_scratch/models/transformer_ko_en_base/model-trained-2more.mdl', device=device)
+    # TransformerModel.load_bf16(model, 'C:/Users/diamo/projects/Transformer_from_scratch/models/transformer_ko_en_base_v2/model-checkpoint-epoch1-iter8000-all.mdl', device=device)
     
     # Train
     train_model(

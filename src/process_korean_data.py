@@ -171,7 +171,7 @@ def download_data(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
     test = test.with_format(type='torch')
 
     train_loader = DataLoader(train, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=0)
-    valid_loader = DataLoader(valid, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0)
+    valid_loader = DataLoader(valid, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=0)
     test_loader = DataLoader(test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0)
 
     return train_loader, valid_loader, test_loader

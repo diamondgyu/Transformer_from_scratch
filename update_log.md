@@ -30,7 +30,7 @@
 - GQA
 - RoPE
 - SwiGLU
-- Flash Attention
+- Flash Attention (미적용 -> windows 환경에서는 힘듬)
 
 ## AI 기반 개발 장점
 - 정형화된 논리 (KV Caching, Beam search) 같은 것들은 ai 가 탁월하게 잘 만듬
