@@ -85,9 +85,7 @@ class MultiheadAttentionCustom(Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
         return self.out_proj(context)
 
-
 #  Encoder Layer                                                              
-
 class Encoder(Module):
     def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, hidden_layer_dim: int):
         super().__init__()
@@ -119,10 +117,7 @@ class Encoder(Module):
         x = x + ffnn_out
         return x
 
-
-# --------------------------------------------------------------------------- #
-#  Decoder Layer                                                              #
-# --------------------------------------------------------------------------- #
+#  Decoder Layer
 class Decoder(Module):
     def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, hidden_layer_dim: int):
         super().__init__()
@@ -175,10 +170,7 @@ class Decoder(Module):
         x = x + ffnn_out
         return x
 
-
-# --------------------------------------------------------------------------- #
-#  Transformer Model                                                          #
-# --------------------------------------------------------------------------- #
+#  Transformer Model
 class TransformerModel(Module):
     """
     Encoder-Decoder Transformer with:
@@ -189,7 +181,7 @@ class TransformerModel(Module):
       • Vectorized beam search
     """
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float,
+    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, tokenizer,
                  hidden_layer_dim: int, max_len: int, vocab_size: int, stacks: int, pad_token_id: int):
         super().__init__()
 
@@ -203,6 +195,7 @@ class TransformerModel(Module):
 
         self.pad_token_id = pad_token_id
 
+        self.tokenizer = tokenizer
         # Embedding layers
         self.token_embedding = Embedding(vocab_size, embed_dim)
         self.token_embedding_dec = self.token_embedding  # Share source and target token embeddings (optional)
@@ -386,17 +379,25 @@ class TransformerModel(Module):
     # Vectorized beam search with Length Penalty & KV cache
     # Vibe-Coded
     @torch.no_grad()
-    def beam_generate(self, src, bos_token_id, eos_token_id,
-                      num_beams=5, max_len=None, length_penalty=1.0):
+    def beam_generate(self, input_text, bos_token_id, eos_token_id,
+                      num_beams=7, max_len=None, length_penalty=1.0, repetition_penalty = 1.3):
         """
         Batch-vectorized beam search with Length Penalty.
         Returns: (batch, ≤max_len) token ids of the best beam per sentence.
         """
+
+        if isinstance(input_text, str):
+            encoded = self.tokenizer(input_text, padding='max_length',
+                                truncation=True, max_length=max_len)
+            src = torch.as_tensor(
+                encoded['input_ids'], dtype=torch.long, device=self.device,
+            ).unsqueeze(0)
+
         if max_len is None:
             max_len = self.max_len
 
         self.eval()
-        device = src.device
+        device = self.device
         batch_size = src.size(0)
 
         # 1. Encode source once, then expand for beams
@@ -427,7 +428,6 @@ class TransformerModel(Module):
                                  cross_attn_pad_mask=cross_mask, use_cache=True)
             log_probs = F.log_softmax(logits[:, -1, :], dim=-1)    # (B*beam, V)
             
-            repetition_penalty = 1.2
             if repetition_penalty != 1.0:
                 prev_token_log_probs = torch.gather(log_probs, 1, all_tokens)
                 penalized_log_probs = prev_token_log_probs * repetition_penalty

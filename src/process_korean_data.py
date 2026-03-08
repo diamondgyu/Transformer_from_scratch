@@ -42,6 +42,128 @@ def convert_xlsx_to_json():
     print(f"Converted {len(all_data)} pairs to {output_file}")
     return output_file
 
+def download_data_2(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
+    data_dir = path / 'data'
+    json_path = data_dir / '일상생활및구어체_영한_train_set.json'
+    ratio_key = str(test_ratio).replace('.', 'p')
+    
+    # Unified save paths
+    train_save_path = data_dir / f'ko-en-train-daily-{tokenizer_max_len}'
+    test_save_path = data_dir / f'ko-en-test-daily-{tokenizer_max_len}'
+
+    try:
+        train = HFDataset.load_from_disk(train_save_path)
+        test = HFDataset.load_from_disk(test_save_path)
+        print("Loaded existing daily dataset from disk.")
+    except:
+        print("Daily dataset not found on disk. Creating from JSON...")
+        
+        data = []
+
+        # 1. Load from the main 일상생활 json file
+        if json_path.exists():
+            print(f"Loading {json_path.name}...")
+            with open(json_path, 'r', encoding='utf-8') as f:
+                raw_data = json.load(f)
+            for x in raw_data['data']:
+                data.append({
+                    'translation': {
+                        'ko': x['ko'],
+                        'en': x['en']
+                    }
+                })
+        
+        # 2. Load from all json files in ko2en folder
+        ko2en_dir = data_dir / 'ko2en'
+        if ko2en_dir.exists():
+            ko2en_files = list(ko2en_dir.glob('*.json'))
+            for f_path in ko2en_files:
+                print(f"Loading {f_path.name}...")
+                with open(f_path, 'r', encoding='utf-8') as f:
+                    ko2en_data = json.load(f)
+                for x in ko2en_data:
+                    # '한국어' is korean original text and '영어' is the label
+                    if '한국어' in x and '영어' in x:
+                        data.append({
+                            'translation': {
+                                'ko': x['한국어'],
+                                'en': x['영어']
+                            }
+                        })
+
+        if not data:
+            raise FileNotFoundError("No data found in specified JSON files/folders.")
+
+        full_dataset = HFDataset.from_list(data)
+        dataset = full_dataset.shuffle(seed=42)
+        
+        # Split into train and test
+        split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
+        train_dataset = split_dataset['train']
+        test_dataset = split_dataset['test']
+
+        if len_train > 0:
+            train_dataset = train_dataset.select(range(min(len_train, len(train_dataset))))
+
+        def preprocess_function(examples):
+            source = [example['ko'] for example in examples['translation']]
+            target = [example['en'] for example in examples['translation']]
+            target_with_eos = [t + tokenizer.eos_token for t in target]
+            
+            source_encodings = tokenizer(source, padding='max_length', truncation=True, max_length=tokenizer_max_len)
+            target_encodings = tokenizer(target_with_eos, padding='max_length', truncation=True, max_length=tokenizer_max_len, add_special_tokens=False)
+            
+            return {
+                'input_ids': source_encodings['input_ids'],
+                'labels': target_encodings['input_ids']
+            }
+
+        train = train_dataset.map(preprocess_function, batched=True, load_from_cache_file=False)
+        test = test_dataset.map(preprocess_function, batched=True, load_from_cache_file=False)
+
+        train.save_to_disk(train_save_path)
+        test.save_to_disk(test_save_path)
+        print(f"Saved daily dataset to {train_save_path} and {test_save_path}")
+
+    # Same valid/test logic as process_korean_data
+    valid_sorted_save_path = data_dir / f'ko-en-valid-sorted-daily-{tokenizer_max_len}-r{ratio_key}'
+    test_sorted_save_path = data_dir / f'ko-en-test-sorted-daily-{tokenizer_max_len}-r{ratio_key}'
+
+    try:
+        valid = HFDataset.load_from_disk(valid_sorted_save_path)
+        test = HFDataset.load_from_disk(test_sorted_save_path)
+        print("Loaded sorted daily valid/test datasets from disk.")
+    except:
+        print("Sorted daily valid/test datasets not found. Creating and saving...")
+        test_split = test.train_test_split(test_size=test_ratio, seed=42)
+        valid = test_split['train']
+        test = test_split['test']
+
+        def get_first_eos_position(example):
+            tensor = example['labels']
+            ones_positions = [i for i, val in enumerate(tensor) if val == tokenizer.eos_token_id]
+            return float('inf') if not ones_positions else ones_positions[0]
+        
+        valid = valid.map(lambda example: {'first_one_position': get_first_eos_position(example)})
+        test = test.map(lambda example: {'first_one_position': get_first_eos_position(example)})
+
+        valid = valid.sort('first_one_position').remove_columns(['first_one_position'])
+        test = test.sort('first_one_position').remove_columns(['first_one_position'])
+
+        valid.save_to_disk(valid_sorted_save_path)
+        test.save_to_disk(test_sorted_save_path)
+        print("Sorted daily valid/test datasets saved to disk.")
+
+    train = train.with_format(type='torch')
+    valid = valid.with_format(type='torch')
+    test = test.with_format(type='torch')
+
+    train_loader = DataLoader(train, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=0)
+    valid_loader = DataLoader(valid, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0)
+    test_loader = DataLoader(test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0)
+
+    return train_loader, valid_loader, test_loader
+
 def process_korean_data(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
     data_dir = path / 'data'
     json_path = data_dir / 'korean_english_data.json'

@@ -41,7 +41,7 @@ from transformers import AutoTokenizer
 from torch.optim.lr_scheduler import LambdaLR
 from test import generate, calculate_bleu_score
 import logging
-from process_korean_data import download_data
+from process_korean_data import download_data, download_data_2
 import pathlib
 
 path = pathlib.Path(__file__).parent.parent
@@ -68,10 +68,10 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1, betas=(0.9, 0.98), eps=1e-5)
 
-    warmup_steps = 8000
+    warmup_steps = 6000
     def lr_lambda(current_step: int):
         current_step += 1
-        scale = 0.4 * 512 ** -0.5
+        scale = 0.5 * 512 ** -0.5
         warmup = current_step * (warmup_steps ** -1.5)
         decay = current_step ** -0.5
         wandb.log({'lr': scale * min(warmup, decay)}, step=count)
@@ -239,7 +239,7 @@ def test():
     run_name = 'transformer_ko_en_base'
 
     # Download dataset
-    train, valid, test = download_data(
+    train, valid, test = download_data_2(
         batch_size=batch_size, tokenizer_max_len=tokenizer_max_len,
         len_train=len_train,
     )
@@ -257,6 +257,7 @@ def test():
         vocab_size=vocab_size,
         stacks=stacks,
         pad_token_id=tokenizer.pad_token_id,
+        tokenizer=tokenizer,
     )
 
     device = torch.device(device_name if torch.cuda.is_available() else 'cpu')
@@ -264,7 +265,7 @@ def test():
     print(device)
 
     # To load an existing checkpoint
-    # TransformerModel.load_bf16(model, 'models/.../checkpoint.mdl', device=device)
+    TransformerModel.load_bf16(model, 'C:/Users/diamo/projects/Transformer_from_scratch/models/transformer_ko_en_base/model-trained-2more.mdl', device=device)
     
     # Train
     train_model(
