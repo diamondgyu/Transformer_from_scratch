@@ -379,26 +379,28 @@ class TransformerModel(Module):
     # Vectorized beam search with Length Penalty & KV cache
     # Vibe-Coded
     @torch.no_grad()
-    def beam_generate(self, input_text, bos_token_id, eos_token_id,
-                      num_beams=7, max_len=None, length_penalty=1.0, repetition_penalty = 1.3):
+    def beam_generate(self, src, num_beams=7, max_len=None, 
+                      length_penalty=1.0, repetition_penalty = 1.3):
         """
         Batch-vectorized beam search with Length Penalty.
         Returns: (batch, ≤max_len) token ids of the best beam per sentence.
         """
 
-        if isinstance(input_text, str):
-            encoded = self.tokenizer(input_text, padding='max_length',
+        if isinstance(src, str):
+            encoded = self.tokenizer(src, padding='max_length',
                                 truncation=True, max_length=max_len)
             src = torch.as_tensor(
-                encoded['input_ids'], dtype=torch.long, device=self.device,
+                encoded['input_ids'], dtype=torch.long, device=self.token_embedding.weight.device,
             ).unsqueeze(0)
 
         if max_len is None:
             max_len = self.max_len
 
         self.eval()
-        device = self.device
+        device = self.token_embedding.weight.device
         batch_size = src.size(0)
+        bos_token_id = self.tokenizer.bos_token_id
+        eos_token_id = self.tokenizer.eos_token_id
 
         # 1. Encode source once, then expand for beams
         encoder_output = self.encode(src) # (B, S, E)

@@ -7,22 +7,30 @@
 - Attention Scaling 관련 문제
 - sacrebleu 를 통한 batch scoring 을 하지 않아 점수 뻥튀기 가능성 존재
 
-### 최적화 미스
+### 최적화 미스 (of 25.03 version)
 - KV cache 미사용
 - 인코더와 디코더가 분리되어 있지 않음
 - 그것때문에 인코더 값 재사용 불가
 - 버퍼 미사용
 - bf16 미사용
 - validation 을 너무 많이 해서 성능 이슈 존재
-- Beam search 만들어두고 쓰지 않음 (내가 짜지 않은 걸 쓰는데 거부감이 있었음)
+- Beam search 만들어두고 쓰지 않음 (당시 AI코딩의 떨어지는 완성도 때문)
 
 # 새 버전 만들기
+- 위 문제점들 수정
 - 토크나이저 교체 (FacebookAI/xlm-roberta-base)
 - 다국어 모델(XLM-R)의 과도한 Vocab Size로 인해 가정용 컴퓨터 학습 불가 -> klue/roberta-base로 변경
 - lr 이 지나치게 커 그래디언트 폭주 (원인을 정확히 알 수는 없으나 독일어 버전에 비해 바뀐 한국어용 토크나이저 관련 문제일 것으로 추정) -> lr 조정 (scale에 0.5 곱)
 - bos, eos, pad 등 특수토큰 매핑 (klue 는 bos, eos 가 아닌 cls sep 임)
 - 어순과 단어가 유사한 독-영 번역과는 다르게 한국어는 영어와 많이 달라 학습 잘 안됨 (loss 약 5.8에서 정체) -> 배치 줄이고 head 16으로 늘리고 stack을 8로 늘려 학습하니 읽을만한 수준의 번역이 나옴
 - stack을 10까지 늘리면 더 좋아질 것으로 예상하나 자원 부족으로 인해 패스
+
+## 추가 가능한 메커니즘들 (TBA)
+- RMSNorm
+- GQA
+- RoPE
+- SwiGLU
+- Flash Attention
 
 ## AI 기반 개발 장점
 - 정형화된 논리 (KV Caching, Beam search) 같은 것들은 ai 가 탁월하게 잘 만듬
@@ -33,3 +41,4 @@
 - 한국어 토크나이저의 특수토큰 처리 같은 ad hoc 처리는 ai가 못함
 - A처럼 하면 된다고 했는데, 내가 'A는 이런 문제가 있으니 B아니냐' 라고 묻자 아 죄송합니다 B네요 이런 적 많았음... 예를 들면 repetition penalty 미적용 문제
 - Learning rate 조정이나 데이터셋 선정, 모델 구조 선정 같은 요소들은 ai가 해줄수 없음
+- 알고리즘 선정은 당연히 AI 가 해줄 수 없음 -> 직접 리서치 필요

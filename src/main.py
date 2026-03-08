@@ -136,7 +136,7 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
                         torch.argmax(model(src, tgt_input), dim=-1)[0],
                         skip_special_tokens=True,
                     )
-                    result = generate(model, src[0].unsqueeze(0), tokenizer, max_len=tokenizer_max_len)
+                    result = model.beam_generate(src[0].unsqueeze(0), max_len=tokenizer_max_len)
                     result = tokenizer.batch_decode(result, skip_special_tokens=True)[0]
                     bleu_score = calculate_bleu_score(result, batch['translation']['en'][0])
                     wandb.log({"BLEU Score": bleu_score}, step=count)

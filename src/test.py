@@ -10,31 +10,6 @@ from process_korean_data import download_data
 import sacrebleu
 import pathlib
 
-device_name = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-
-tokenizer = AutoTokenizer.from_pretrained("klue/roberta-base")
-tokenizer.bos_token = tokenizer.cls_token
-tokenizer.eos_token = tokenizer.sep_token
-
-def generate(model, input_text, tokenizer, max_len):
-    device = next(model.parameters()).device
-    model.eval()
-
-    if isinstance(input_text, str):
-        encoded = tokenizer(input_text, padding='max_length',
-                            truncation=True, max_length=max_len)
-        input_text = torch.as_tensor(
-            encoded['input_ids'], dtype=torch.long, device=device,
-        ).unsqueeze(0)
-
-    return model.beam_generate(
-        src=input_text,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        max_len=max_len,
-    )
-
-
 def calculate_bleu_score(generated_sentence, label):
     """Sentence-level BLEU via sacrebleu (returns 0-1 scale)."""
     score = sacrebleu.sentence_bleu(generated_sentence, [label])
@@ -59,6 +34,13 @@ def cut_string_between_bos_eos(string, bos='[CLS]', eos='[SEP]'):
 
 # Example Usage
 if __name__ == "__main__":
+
+    device_name = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+    tokenizer = AutoTokenizer.from_pretrained("klue/roberta-base")
+    tokenizer.bos_token = tokenizer.cls_token
+    tokenizer.eos_token = tokenizer.sep_token
+    
     # This is KR->EN translation.
     local_model_path = "C:/Users/diamo/projects/Transformer_from_scratch/models/transformer_ko_en_base/model-checkpoint-epoch2-iter35000-all.mdl"
 
@@ -97,19 +79,21 @@ if __name__ == "__main__":
         input_text1 = input('Enter Korean sentence (type \'quit\' to quit): ')
         if input_text1 == 'quit':
             break
+        
+        reference_text = input('Enter Reference English sentence (optional, press Enter to skip): ')
 
         test_input = tokenizer(
             [input_text1], padding='max_length', truncation=True,
             return_tensors="pt", max_length=tokenizer_max_len,
         ).to(device=device)
 
-        output_sentences = generate(model, test_input['input_ids'], tokenizer,
-                                    max_len=tokenizer_max_len)
+        output_sentences = model.beam_generate(test_input['input_ids'],
+                                               max_len=tokenizer_max_len)
         output_sentences = tokenizer.batch_decode(output_sentences, skip_special_tokens=False)
         translation = cut_string_between_bos_eos(output_sentences[0])
 
         print('Translation:', translation)
-        bleu_scores.append(calculate_bleu_score(translation, input_text1))
+        
         print()
 
     '''  ------------------------------------------------------------------------------------------------  '''
@@ -125,7 +109,7 @@ if __name__ == "__main__":
 
     # for batch in tqdm(test_data):
     #     input_sentences = batch['input_ids'].to(device, non_blocking=True).contiguous()
-    #     output_sentences = generate(model, input_sentences, tokenizer, max_len=tokenizer_max_len)
+    #     output_sentences = model.beam_generate(input_sentences, max_len=tokenizer_max_len)
 
     #     output_texts = tokenizer.batch_decode(output_sentences, skip_special_tokens=False)
 
