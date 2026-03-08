@@ -39,9 +39,9 @@ import wandb
 from model import TransformerModel
 from transformers import AutoTokenizer
 from torch.optim.lr_scheduler import LambdaLR
-from test import generate, calculate_bleu_score
+from test import calculate_bleu_score
 import logging
-from process_korean_data import download_data, download_data_2
+from process_korean_data import download_data
 import pathlib
 
 path = pathlib.Path(__file__).parent.parent
@@ -68,10 +68,10 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1, betas=(0.9, 0.98), eps=1e-5)
 
-    warmup_steps = 6000
+    warmup_steps = 8000
     def lr_lambda(current_step: int):
         current_step += 1
-        scale = 0.5 * 512 ** -0.5
+        scale = 0.4 * 512 ** -0.5
         warmup = current_step * (warmup_steps ** -1.5)
         decay = current_step ** -0.5
         wandb.log({'lr': scale * min(warmup, decay)}, step=count)
@@ -125,45 +125,23 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
                 optimizer.step()
                 scheduler.step()
             
-            
-
             if count % 1000 == 1:
 
                 model.eval()
 
-                with torch.no_grad():
-                    output_tf = tokenizer.decode(
-                        torch.argmax(model(src, tgt_input), dim=-1)[0],
-                        skip_special_tokens=True,
-                    )
-                    result = model.beam_generate(src[0].unsqueeze(0), max_len=tokenizer_max_len)
-                    result = tokenizer.batch_decode(result, skip_special_tokens=True)[0]
-                    bleu_score = calculate_bleu_score(result, batch['translation']['en'][0])
-                    wandb.log({"BLEU Score": bleu_score}, step=count)
-
-                    logger_main.info('')
-                    logger_main.info('--------------------------------------------------------')
-                    logger_main.info('')
-                    logger_main.info('Epoch {}, Batch {}'.format(epoch + 1, count % len(train)))
-                    logger_main.info('Original Text:')
-                    logger_main.info(batch['translation'][language][0])
-                    logger_main.info('')
-                    logger_main.info('Ideal Output:')
-                    logger_main.info(batch['translation']['en'][0])
-                    logger_main.info('')
-                    logger_main.info('Output(teacher forced):')
-                    logger_main.info(output_tf)
-                    logger_main.info('')
-                    logger_main.info('Generated Text: ')
-                    logger_main.info(result)
-
                 # Sampled validation (fixed N batches to avoid stalling training)
                 n_valid_batches = 50
                 total_valid_loss = 0
+                bleu_src_samples = []
+                bleu_ref_samples = []
+                bleu_ko_samples = []
+                valid_batches_seen = 0
                 with torch.no_grad():
                     for i, valid_batch in enumerate(valid):
                         if i >= n_valid_batches:
                             break
+                        valid_batches_seen += 1
+
                         v_src = valid_batch['input_ids'].to(device, non_blocking=True)
                         v_tgt = valid_batch['labels'].to(device, non_blocking=True)
                         bos_col = torch.full((v_tgt.size(0), 1), tokenizer.bos_token_id,
@@ -178,8 +156,46 @@ def train_model(model, train, valid, device, vocab_size, run_name, tokenizer_max
                                 v_tgt.view(-1),
                             ).item()
 
-                valid_loss = total_valid_loss / n_valid_batches
+                        # Collect one random source/reference from each validation batch
+                        sample_idx = torch.randint(0, valid_batch['input_ids'].size(0), (1,)).item()
+                        bleu_src_samples.append(valid_batch['input_ids'][sample_idx])
+                        bleu_ref_samples.append(valid_batch['translation']['en'][sample_idx])
+                        bleu_ko_samples.append(valid_batch['translation'][language][sample_idx])
+
+                valid_loss = total_valid_loss / max(valid_batches_seen, 1)
                 wandb.log({"Valid Loss": valid_loss}, step=count)
+
+                # BLEU from 50 validation sources (1 random sample from each of 50 validation batches)
+                if bleu_src_samples:
+                    sample_count = len(bleu_src_samples)
+                    sampled_src = torch.stack(bleu_src_samples).to(device, non_blocking=True)
+
+                    generated_ids = model.beam_generate(sampled_src, max_len=tokenizer_max_len)
+                    generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+                    bleu_scores = [
+                        calculate_bleu_score(pred, ref)
+                        for pred, ref in zip(generated_texts, bleu_ref_samples)
+                    ]
+                    avg_bleu = sum(bleu_scores) / len(bleu_scores)
+                    wandb.log({"BLEU Score": avg_bleu}, step=count)
+
+                    logger_main.info('')
+                    logger_main.info('--------------------------------------------------------')
+                    logger_main.info('')
+                    logger_main.info('Epoch {}, Batch {}'.format(epoch + 1, count % len(train)))
+                    logger_main.info('Validation Sample BLEU (n={}): {:.4f}'.format(sample_count, avg_bleu))
+
+                    for j in range(sample_count):
+                        logger_main.info('')
+                        logger_main.info('[Sample {}]'.format(j + 1))
+                        logger_main.info('Original Text:')
+                        logger_main.info(bleu_ko_samples[j])
+                        logger_main.info('Ideal Output:')
+                        logger_main.info(bleu_ref_samples[j])
+                        logger_main.info('Generated Text:')
+                        logger_main.info(generated_texts[j])
+                        logger_main.info('BLEU: {:.4f}'.format(bleu_scores[j]))
 
                 # Save model in bf16 if improved (or at end of epoch)
                 if valid_loss < best_loss or count % len(batches) == 0:
@@ -236,10 +252,10 @@ def test():
     batch_size = 48
     len_train = -1
     epochs = 5
-    run_name = 'transformer_ko_en_base'
+    run_name = 'transformer_ko_en_base_v2'
 
     # Download dataset
-    train, valid, test = download_data_2(
+    train, valid, test = download_data(
         batch_size=batch_size, tokenizer_max_len=tokenizer_max_len,
         len_train=len_train,
     )
@@ -265,7 +281,7 @@ def test():
     print(device)
 
     # To load an existing checkpoint
-    TransformerModel.load_bf16(model, 'C:/Users/diamo/projects/Transformer_from_scratch/models/transformer_ko_en_base/model-trained-2more.mdl', device=device)
+    # TransformerModel.load_bf16(model, 'C:/Users/diamo/projects/Transformer_from_scratch/models/transformer_ko_en_base/model-trained-2more.mdl', device=device)
     
     # Train
     train_model(

@@ -8,28 +8,78 @@ Architecture:
 '''
 
 import torch
-from torch.nn import Module, ModuleList, Linear, ReLU, Dropout, LayerNorm, Sequential, Embedding
+from torch.nn import Module, ModuleList, Linear, Dropout, Embedding
 import torch.nn.functional as F
 import math
+
+
+class RMSNorm(Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+class SwiGLU(Module):
+    def __init__(self, in_dim: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.w1 = Linear(in_dim, hidden_dim, bias=True)
+        self.w2 = Linear(in_dim, hidden_dim, bias=True)
+        self.w3 = Linear(hidden_dim, in_dim, bias=True)
+        self.dropout = Dropout(p=dropout)
+
+    def forward(self, x):
+        gated = F.silu(self.w1(x)) * self.w2(x)
+        return self.dropout(self.w3(gated))
+
+class FeedForward(Module):
+    def __init__(self, in_dim: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        # 파이토치 내장 Sequential을 사용하여 직관적으로 구성
+        self.net = torch.nn.Sequential(
+            Linear(in_dim, hidden_dim),
+            torch.nn.GELU(),
+            Dropout(p=dropout),
+            Linear(hidden_dim, in_dim),
+            Dropout(p=dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 # Multi-Head Attention from Scratch (with caching)
 class MultiheadAttentionCustom(Module):
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float):
+    def __init__(self, embed_dim: int, num_heads: int, num_kv_heads: int,
+                 dropout: float, max_len: int, rope_base: float = 10000.0):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.kv_group_size = num_heads // num_kv_heads
         self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
+        self.rope_base = rope_base
+        self.max_len = max_len
 
         self.Q = Linear(embed_dim, embed_dim, bias=False)
-        self.K = Linear(embed_dim, embed_dim, bias=False)
-        self.V = Linear(embed_dim, embed_dim, bias=False)
+        self.K = Linear(embed_dim, num_kv_heads * self.head_dim, bias=False)
+        self.V = Linear(embed_dim, num_kv_heads * self.head_dim, bias=False)
 
         self.out_proj = Linear(embed_dim, embed_dim, bias=True)
 
-        self.attn_dropout = Dropout(p=dropout)
+        # RoPE tables are precomputed once and stored as non-persistent buffers.
+        inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+        positions = torch.arange(self.max_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)  # (max_len, head_dim/2)
+        self.register_buffer("rope_cos", freqs.cos().view(1, self.max_len, 1, -1), persistent=False)
+        self.register_buffer("rope_sin", freqs.sin().view(1, self.max_len, 1, -1), persistent=False)
 
         # KV cache (populated during inference only)
         self.k_cache = None
@@ -39,79 +89,185 @@ class MultiheadAttentionCustom(Module):
         self.k_cache = None
         self.v_cache = None
 
+    def _apply_rope(self, x, position_ids):
+        # x: (B, L, H, D)
+        if x.size(-1) % 2 != 0:
+            return x
+
+        seq_len = x.size(1)
+
+        if position_ids is None:
+            # Fast path: use slicing over precomputed RoPE tables.
+            if seq_len <= self.max_len:
+                cos = self.rope_cos[:, :seq_len, :, :].to(dtype=x.dtype, device=x.device)
+                sin = self.rope_sin[:, :seq_len, :, :].to(dtype=x.dtype, device=x.device)
+            else:
+                # Fallback for sequence lengths beyond configured max_len.
+                inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, self.head_dim, 2, device=x.device, dtype=torch.float32) / self.head_dim))
+                pos = torch.arange(seq_len, device=x.device)
+                freqs = torch.outer(pos.to(torch.float32), inv_freq)
+                cos = freqs.cos().view(1, seq_len, 1, -1).to(dtype=x.dtype)
+                sin = freqs.sin().view(1, seq_len, 1, -1).to(dtype=x.dtype)
+        else:
+            max_pos = int(position_ids.max().item()) if position_ids.numel() > 0 else -1
+            if position_ids.dim() == 1 and max_pos < self.max_len:
+                if torch.equal(position_ids, torch.arange(seq_len, device=position_ids.device)):
+                    cos = self.rope_cos[:, :seq_len, :, :].to(dtype=x.dtype, device=x.device)
+                    sin = self.rope_sin[:, :seq_len, :, :].to(dtype=x.dtype, device=x.device)
+                else:
+                    cos = self.rope_cos[0, position_ids, 0, :].view(1, seq_len, 1, -1).to(dtype=x.dtype, device=x.device)
+                    sin = self.rope_sin[0, position_ids, 0, :].view(1, seq_len, 1, -1).to(dtype=x.dtype, device=x.device)
+            else:
+                inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, self.head_dim, 2, device=x.device, dtype=torch.float32) / self.head_dim))
+                if position_ids.dim() == 1:
+                    freqs = torch.outer(position_ids.to(torch.float32), inv_freq)
+                    cos = freqs.cos().view(1, seq_len, 1, -1).to(dtype=x.dtype)
+                    sin = freqs.sin().view(1, seq_len, 1, -1).to(dtype=x.dtype)
+                else:
+                    freqs = position_ids.to(torch.float32).unsqueeze(-1) * inv_freq
+                    cos = freqs.cos().to(dtype=x.dtype).unsqueeze(2)
+                    sin = freqs.sin().to(dtype=x.dtype).unsqueeze(2)
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
+
+        out = torch.empty_like(x)
+        out[..., 0::2] = x_rot_even
+        out[..., 1::2] = x_rot_odd
+        return out
+
+    def _expand_kv(self, x):
+        # x: (B, H_kv, L, D) -> (B, H_q, L, D)
+        if self.num_kv_heads == self.num_heads:
+            return x
+        B, H_kv, L, D = x.size()
+        x = x.unsqueeze(2).expand(B, H_kv, self.kv_group_size, L, D)
+        return x.reshape(B, self.num_heads, L, D)
+
+    def _to_keep_mask(self, mask, device):
+        if mask is None:
+            return None
+        if mask.dtype != torch.bool:
+            mask = mask != 0
+        mask = mask.to(device=device)
+        if mask.dim() == 2:
+            return mask.unsqueeze(0).unsqueeze(0)
+        if mask.dim() == 3:
+            return mask.unsqueeze(1)
+        return mask
+
+    def _merge_masks(self, pad_mask, attn_mask, q_len, device, dtype):
+        keep = None
+
+        attn_keep = self._to_keep_mask(attn_mask, device)
+        if attn_keep is not None:
+            keep = attn_keep
+
+        pad_keep = self._to_keep_mask(pad_mask, device)
+        if pad_keep is not None:
+            keep = pad_keep if keep is None else (keep & pad_keep)
+
+        if keep is None:
+            return None
+
+        if keep.size(-2) == 1 and q_len > 1:
+            keep = keep.expand(-1, -1, q_len, -1)
+
+        return keep
+
     def forward(self, query, key, value, pad_mask=None, attn_mask=None,
-                use_cache=False, is_cross_attn=False):
+                use_cache=False, is_cross_attn=False,
+                query_position_ids=None, key_position_ids=None):
         batch_size = query.size(0)
 
-        Q = self.Q(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        q_len = query.size(1)
+        Q = self.Q(query).view(batch_size, q_len, self.num_heads, self.head_dim)
+        Q = self._apply_rope(Q, query_position_ids)
+        Q = Q.transpose(1, 2)
 
-        # KV calculation
-        # IMPORTANT: transpose -> view -> transpose!!!!!!
-        # The dimensions will be the same but the alignments will be broken otherwise
+        # KV calculation (stored in KV-head space for cache efficiency)
         if use_cache:
             if is_cross_attn and self.k_cache is not None:
-                # reuse cache
-                K, V = self.k_cache, self.v_cache
+                K_kv, V_kv = self.k_cache, self.v_cache
             else:
-                K_new = self.K(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-                V_new = self.V(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                kv_len = key.size(1)
+                K_new = self.K(key).view(batch_size, kv_len, self.num_kv_heads, self.head_dim)
+                V_new = self.V(value).view(batch_size, kv_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                K_new = self._apply_rope(K_new, key_position_ids)
+                K_new = K_new.transpose(1, 2)
 
                 if not is_cross_attn and self.k_cache is not None:
-                    # Self-attention: append new token's K,V
-                    K = torch.cat([self.k_cache, K_new], dim=2)
-                    V = torch.cat([self.v_cache, V_new], dim=2)
+                    K_kv = torch.cat([self.k_cache, K_new], dim=2)
+                    V_kv = torch.cat([self.v_cache, V_new], dim=2)
                 else:
-                    K, V = K_new, V_new
+                    K_kv, V_kv = K_new, V_new
 
-                self.k_cache = K
-                self.v_cache = V
+                self.k_cache = K_kv
+                self.v_cache = V_kv
         else:
-            # Training path – no caching
-            K = self.K(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            V = self.V(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            kv_len = key.size(1)
+            K_kv = self.K(key).view(batch_size, kv_len, self.num_kv_heads, self.head_dim)
+            V_kv = self.V(value).view(batch_size, kv_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            K_kv = self._apply_rope(K_kv, key_position_ids)
+            K_kv = K_kv.transpose(1, 2)
 
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        K = self._expand_kv(K_kv)
+        V = self._expand_kv(V_kv)
 
-        if attn_mask is not None:
-            scores = scores.masked_fill(attn_mask == 0, -1e4)
-        if pad_mask is not None:
-            scores = scores.masked_fill(pad_mask == 0, -1e4)
+        attn_bias = self._merge_masks(
+            pad_mask=pad_mask,
+            attn_mask=attn_mask,
+            q_len=q_len,
+            device=query.device,
+            dtype=Q.dtype,
+        )
 
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        context = torch.matmul(attn_weights, V)
+        # Flash Attention via PyTorch SDPA kernel when available.
+        context = F.scaled_dot_product_attention(
+            Q, K, V,
+            attn_mask=attn_bias,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
         return self.out_proj(context)
 
 #  Encoder Layer                                                              
 class Encoder(Module):
-    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, hidden_layer_dim: int):
+    def __init__(self, embed_dim: int, num_heads: int, num_kv_heads: int,
+                 dropout_rate: float, hidden_layer_dim: int, max_len: int, rope_base: float):
         super().__init__()
 
         self.multihead_attention = MultiheadAttentionCustom(
-            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout_rate,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            dropout=dropout_rate,
+            max_len=max_len,
+            rope_base=rope_base,
         )
-        self.feedforward = Sequential(
-            Linear(embed_dim, hidden_layer_dim, bias=True),
-            ReLU(),
-            Dropout(p=dropout_rate),
-            Linear(hidden_layer_dim, embed_dim, bias=True),
-            Dropout(p=dropout_rate),
-        )
+        self.feedforward = FeedForward(embed_dim, hidden_layer_dim, dropout_rate)
 
-        # Each sub-layer gets its own LayerNorm (pre-norm style)
-        self.layer_norm_attn = LayerNorm(embed_dim, eps=1e-05)
-        self.layer_norm_ffnn = LayerNorm(embed_dim, eps=1e-05)
+        # Each sub-layer gets its own RMSNorm (pre-norm style)
+        self.layer_norm_attn = RMSNorm(embed_dim)
+        self.layer_norm_ffnn = RMSNorm(embed_dim)
 
-    def forward(self, x, pad_mask):
+    def forward(self, x, pad_mask, position_ids):
         # Pre-norm self-attention + residual
         normed = self.layer_norm_attn(x)
-        attn_out = self.multihead_attention(query=normed, key=normed, value=normed, pad_mask=pad_mask)
+        attn_out = self.multihead_attention(
+            query=normed,
+            key=normed,
+            value=normed,
+            pad_mask=pad_mask,
+            query_position_ids=position_ids,
+            key_position_ids=position_ids,
+        )
         x = x + attn_out
 
-        # Pre-norm feedforward + residual  (FIX: uses layer_norm_ffnn, not layer_norm_attn)
+        # Pre-norm feedforward + residual
         normed = self.layer_norm_ffnn(x)
         ffnn_out = self.feedforward(normed)
         x = x + ffnn_out
@@ -119,39 +275,47 @@ class Encoder(Module):
 
 #  Decoder Layer
 class Decoder(Module):
-    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, hidden_layer_dim: int):
+    def __init__(self, embed_dim: int, num_heads: int, num_kv_heads: int,
+                 dropout_rate: float, hidden_layer_dim: int, max_len: int, rope_base: float):
         super().__init__()
 
         self.masked_multihead_attention = MultiheadAttentionCustom(
-            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout_rate,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            dropout=dropout_rate,
+            max_len=max_len,
+            rope_base=rope_base,
         )
         self.multihead_attention = MultiheadAttentionCustom(
-            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout_rate,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            dropout=dropout_rate,
+            max_len=max_len,
+            rope_base=rope_base,
         )
-        self.feedforward = Sequential(
-            Linear(embed_dim, hidden_layer_dim, bias=True),
-            ReLU(),
-            Dropout(p=dropout_rate),
-            Linear(hidden_layer_dim, embed_dim, bias=True),
-            Dropout(p=dropout_rate),
-        )
+        self.feedforward = FeedForward(embed_dim, hidden_layer_dim, dropout_rate)
 
-        # Dedicated LayerNorm per sub-layer (FIX: previous code reused layer_norm_attn for all three)
-        self.layer_norm_mask_attn = LayerNorm(embed_dim, eps=1e-05)
-        self.layer_norm_attn = LayerNorm(embed_dim, eps=1e-05)
-        self.layer_norm_ffnn = LayerNorm(embed_dim, eps=1e-05)
+        # Dedicated RMSNorm per sub-layer
+        self.layer_norm_mask_attn = RMSNorm(embed_dim)
+        self.layer_norm_attn = RMSNorm(embed_dim)
+        self.layer_norm_ffnn = RMSNorm(embed_dim)
 
     def clear_cache(self):
         self.masked_multihead_attention.clear_cache()
         self.multihead_attention.clear_cache()
 
     def forward(self, x, encoder_output, pad_mask=None, target_mask=None,
-                use_cache=False, cross_attn_pad_mask=None):
+                use_cache=False, cross_attn_pad_mask=None,
+                tgt_position_ids=None, src_position_ids=None):
         # 1. Pre-norm masked self-attention + residual
         normed = self.layer_norm_mask_attn(x)
         masked_attn_out = self.masked_multihead_attention(
             query=normed, key=normed, value=normed,
             pad_mask=pad_mask, attn_mask=target_mask, use_cache=use_cache,
+            query_position_ids=tgt_position_ids,
+            key_position_ids=tgt_position_ids,
         )
         x = x + masked_attn_out
 
@@ -161,6 +325,8 @@ class Decoder(Module):
         attn_out = self.multihead_attention(
             query=normed, key=encoder_output, value=encoder_output,
             pad_mask=cross_mask, use_cache=use_cache, is_cross_attn=True,
+            query_position_ids=tgt_position_ids,
+            key_position_ids=src_position_ids,
         )
         x = x + attn_out
 
@@ -181,8 +347,10 @@ class TransformerModel(Module):
       • Vectorized beam search
     """
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, tokenizer,
-                 hidden_layer_dim: int, max_len: int, vocab_size: int, stacks: int, pad_token_id: int):
+    def __init__(self, embed_dim: int, num_heads: int, dropout_rate: float, tokenizer=None,
+                 hidden_layer_dim: int = 2048, max_len: int = 128, vocab_size: int = 32000,
+                 stacks: int = 6, pad_token_id: int = 0, num_kv_heads: int = None,
+                 rope_base: float = 10000.0):
         super().__init__()
 
         self.max_len = max_len
@@ -192,6 +360,11 @@ class TransformerModel(Module):
         self.hidden_layer_dim = hidden_layer_dim
         self.vocab_size = vocab_size
         self.embed_scale = math.sqrt(embed_dim)
+        if num_kv_heads is None:
+            num_kv_heads = num_heads // 2 if (num_heads % 2 == 0) else num_heads
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.num_kv_heads = num_kv_heads
 
         self.pad_token_id = pad_token_id
 
@@ -202,66 +375,49 @@ class TransformerModel(Module):
 
         # Encoder / Decoder stacks
         self.encoders = ModuleList([
-            Encoder(embed_dim, num_heads, dropout_rate, hidden_layer_dim)
+            Encoder(embed_dim, num_heads, num_kv_heads, dropout_rate, hidden_layer_dim, max_len, rope_base)
             for _ in range(stacks)
         ])
         self.decoders = ModuleList([
-            Decoder(embed_dim, num_heads, dropout_rate, hidden_layer_dim)
+            Decoder(embed_dim, num_heads, num_kv_heads, dropout_rate, hidden_layer_dim, max_len, rope_base)
             for _ in range(stacks)
         ])
-
-        self.register_buffer(
-            'positional_encoding',
-            self._generate_positional_encoding(max_len, embed_dim),
-        )
         self.register_buffer(
             'causal_mask',
-            torch.tril(torch.ones(max_len, max_len)),
+            torch.tril(torch.ones(max_len, max_len, dtype=torch.bool)),
         )
 
         # Output head
-        self.final_layer_norm = LayerNorm(embed_dim)
+        self.final_layer_norm = RMSNorm(embed_dim)
         self.output_layer = Linear(embed_dim, vocab_size, bias=True)
         self.output_layer.weight = self.token_embedding.weight
 
         # Decode-position tracker for KV cache (not saved in state_dict)
         self._decode_pos = 0
 
-    #  Positional encoding          
-    @staticmethod              
-    def _generate_positional_encoding(max_len, embed_dim):
-        pe = torch.zeros(max_len, embed_dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe.unsqueeze(0)  # (1, max_len, embed_dim)
+        torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        if self.output_layer.bias is not None:
+            torch.nn.init.zeros_(self.output_layer.bias)
 
     #  Mask helpers
     def _make_src_pad_mask(self, src):
-        mask = (src != self.pad_token_id)  # (B, S)
-        col_mask = mask.unsqueeze(1).unsqueeze(2)   # (B, 1, 1, S)
-        row_mask = mask.unsqueeze(1).unsqueeze(3)   # (B, 1, S, 1)
-        return (col_mask & row_mask).expand(-1, self.num_heads, -1, -1)
+        return (src != self.pad_token_id).unsqueeze(1).unsqueeze(2)
     
     def _make_tgt_pad_mask(self, tgt):
-        mask = (tgt != self.pad_token_id).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
-        return mask.expand(-1, self.num_heads, -1, -1)
+        return (tgt != self.pad_token_id).unsqueeze(1).unsqueeze(2)
     
     def _make_cross_attn_pad_mask(self, src):
-        mask = (src != self.pad_token_id).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
-        return mask.expand(-1, self.num_heads, -1, -1)
+        return (src != self.pad_token_id).unsqueeze(1).unsqueeze(2)
 
     #  Encode / Decode  (separable for reusable source encoding during inference)
     def encode(self, src):
         """Encode source tokens → encoder hidden states (B, S, E)."""
         pad_mask = self._make_src_pad_mask(src)
         x = self.token_embedding(src) * self.embed_scale
-        x = x + self.positional_encoding[:, :src.size(1)]
+
+        src_position_ids = torch.arange(src.size(1), device=src.device)
         for encoder in self.encoders:
-            x = encoder(x, pad_mask)
+            x = encoder(x, pad_mask, src_position_ids)
         return x
 
     def decode(self, tgt, encoder_output, tgt_pad_mask=None,
@@ -269,12 +425,17 @@ class TransformerModel(Module):
         seq_len = tgt.size(1)
         x = self.token_embedding_dec(tgt) * self.embed_scale
 
-        # Positional encoding (track cumulative position when caching)
         if use_cache:
-            x = x + self.positional_encoding[:, self._decode_pos:self._decode_pos + seq_len]
+            tgt_position_ids = torch.arange(
+                self._decode_pos,
+                self._decode_pos + seq_len,
+                device=tgt.device,
+            )
             self._decode_pos += seq_len
         else:
-            x = x + self.positional_encoding[:, :seq_len]
+            tgt_position_ids = torch.arange(seq_len, device=tgt.device)
+
+        src_position_ids = torch.arange(encoder_output.size(1), device=tgt.device)
 
         # Causal mask
         target_mask = (
@@ -287,6 +448,8 @@ class TransformerModel(Module):
                 x, encoder_output,
                 pad_mask=tgt_pad_mask, target_mask=target_mask,
                 use_cache=use_cache, cross_attn_pad_mask=cross_attn_pad_mask,
+                tgt_position_ids=tgt_position_ids,
+                src_position_ids=src_position_ids,
             )
 
         x = self.final_layer_norm(x)
@@ -385,6 +548,9 @@ class TransformerModel(Module):
         Batch-vectorized beam search with Length Penalty.
         Returns: (batch, ≤max_len) token ids of the best beam per sentence.
         """
+
+        if self.tokenizer is None:
+            raise ValueError("tokenizer is required for beam_generate.")
 
         if isinstance(src, str):
             encoded = self.tokenizer(src, padding='max_length',

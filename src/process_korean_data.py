@@ -42,57 +42,69 @@ def convert_xlsx_to_json():
     print(f"Converted {len(all_data)} pairs to {output_file}")
     return output_file
 
-def download_data_2(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
+
+def _collect_all_translation_entries(data_dir):
+    all_entries = []
+
+    # Source 1: xlsx-derived jsonl (korean_english_data.json)
+    base_json_path = data_dir / 'korean_english_data.json'
+    if not base_json_path.exists():
+        convert_xlsx_to_json()
+
+    if base_json_path.exists():
+        print(f"Loading {base_json_path.name}...")
+        with open(base_json_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                tr = item.get('translation', {})
+                if 'ko' in tr and 'en' in tr:
+                    all_entries.append({'translation': {'ko': tr['ko'], 'en': tr['en']}})
+
+    # Source 2: 일상생활및구어체_영한_train_set.json
+    daily_json_path = data_dir / '일상생활및구어체_영한_train_set.json'
+    if daily_json_path.exists():
+        print(f"Loading {daily_json_path.name}...")
+        with open(daily_json_path, 'r', encoding='utf-8') as f:
+            raw_data = json.load(f)
+        for item in raw_data.get('data', []):
+            if 'ko' in item and 'en' in item:
+                all_entries.append({'translation': {'ko': item['ko'], 'en': item['en']}})
+
+    # Source 3: ko2en folder json files (한국어 -> ko, 영어 -> en)
+    ko2en_dir = data_dir / 'ko2en'
+    if ko2en_dir.exists():
+        for f_path in ko2en_dir.glob('*.json'):
+            print(f"Loading {f_path.name}...")
+            with open(f_path, 'r', encoding='utf-8') as f:
+                ko2en_data = json.load(f)
+            for item in ko2en_data:
+                if '한국어' in item and '영어' in item:
+                    all_entries.append({'translation': {'ko': item['한국어'], 'en': item['영어']}})
+
+    if not all_entries:
+        raise FileNotFoundError("No translation entries found in any supported data source.")
+
+    return all_entries
+
+def download_data(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
     data_dir = path / 'data'
-    json_path = data_dir / '일상생활및구어체_영한_train_set.json'
     ratio_key = str(test_ratio).replace('.', 'p')
     
-    # Unified save paths
-    train_save_path = data_dir / f'ko-en-train-daily-{tokenizer_max_len}'
-    test_save_path = data_dir / f'ko-en-test-daily-{tokenizer_max_len}'
+    # Unified save paths for combined dataset (download_data + download_data_2 sources)
+    train_save_path = data_dir / f'ko-en-train-combined-{tokenizer_max_len}'
+    test_save_path = data_dir / f'ko-en-test-combined-{tokenizer_max_len}'
 
     try:
         train = HFDataset.load_from_disk(train_save_path)
         test = HFDataset.load_from_disk(test_save_path)
-        print("Loaded existing daily dataset from disk.")
+        print("Loaded existing combined dataset from disk.")
     except:
-        print("Daily dataset not found on disk. Creating from JSON...")
-        
-        data = []
+        print("Combined dataset not found on disk. Creating from all JSON sources...")
 
-        # 1. Load from the main 일상생활 json file
-        if json_path.exists():
-            print(f"Loading {json_path.name}...")
-            with open(json_path, 'r', encoding='utf-8') as f:
-                raw_data = json.load(f)
-            for x in raw_data['data']:
-                data.append({
-                    'translation': {
-                        'ko': x['ko'],
-                        'en': x['en']
-                    }
-                })
-        
-        # 2. Load from all json files in ko2en folder
-        ko2en_dir = data_dir / 'ko2en'
-        if ko2en_dir.exists():
-            ko2en_files = list(ko2en_dir.glob('*.json'))
-            for f_path in ko2en_files:
-                print(f"Loading {f_path.name}...")
-                with open(f_path, 'r', encoding='utf-8') as f:
-                    ko2en_data = json.load(f)
-                for x in ko2en_data:
-                    # '한국어' is korean original text and '영어' is the label
-                    if '한국어' in x and '영어' in x:
-                        data.append({
-                            'translation': {
-                                'ko': x['한국어'],
-                                'en': x['영어']
-                            }
-                        })
-
-        if not data:
-            raise FileNotFoundError("No data found in specified JSON files/folders.")
+        data = _collect_all_translation_entries(data_dir)
 
         full_dataset = HFDataset.from_list(data)
         dataset = full_dataset.shuffle(seed=42)
@@ -123,18 +135,18 @@ def download_data_2(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
 
         train.save_to_disk(train_save_path)
         test.save_to_disk(test_save_path)
-        print(f"Saved daily dataset to {train_save_path} and {test_save_path}")
+        print(f"Saved combined dataset to {train_save_path} and {test_save_path}")
 
-    # Same valid/test logic as process_korean_data
-    valid_sorted_save_path = data_dir / f'ko-en-valid-sorted-daily-{tokenizer_max_len}-r{ratio_key}'
-    test_sorted_save_path = data_dir / f'ko-en-test-sorted-daily-{tokenizer_max_len}-r{ratio_key}'
+    # Same valid/test logic with combined paths
+    valid_sorted_save_path = data_dir / f'ko-en-valid-sorted-combined-{tokenizer_max_len}-r{ratio_key}'
+    test_sorted_save_path = data_dir / f'ko-en-test-sorted-combined-{tokenizer_max_len}-r{ratio_key}'
 
     try:
         valid = HFDataset.load_from_disk(valid_sorted_save_path)
         test = HFDataset.load_from_disk(test_sorted_save_path)
-        print("Loaded sorted daily valid/test datasets from disk.")
+        print("Loaded sorted combined valid/test datasets from disk.")
     except:
-        print("Sorted daily valid/test datasets not found. Creating and saving...")
+        print("Sorted combined valid/test datasets not found. Creating and saving...")
         test_split = test.train_test_split(test_size=test_ratio, seed=42)
         valid = test_split['train']
         test = test_split['test']
@@ -152,7 +164,7 @@ def download_data_2(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
 
         valid.save_to_disk(valid_sorted_save_path)
         test.save_to_disk(test_sorted_save_path)
-        print("Sorted daily valid/test datasets saved to disk.")
+        print("Sorted combined valid/test datasets saved to disk.")
 
     train = train.with_format(type='torch')
     valid = valid.with_format(type='torch')
@@ -261,7 +273,3 @@ def process_korean_data(batch_size, tokenizer_max_len, len_train, test_ratio=0.5
     test_loader = DataLoader(test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0)
 
     return train_loader, valid_loader, test_loader
-
-# Same return format as downloader.py, without short/long split
-def download_data(batch_size, tokenizer_max_len, len_train, test_ratio=0.5):
-    return process_korean_data(batch_size, tokenizer_max_len, len_train, test_ratio)
