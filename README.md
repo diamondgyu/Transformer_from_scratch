@@ -1,13 +1,15 @@
 # Transformer from Scratch
 
 한국어->영어 번역을 위한 Transformer 모델을 학습하고, AWS Serverless 기반으로 배포해 API 형태로 제공하는 프로젝트
+# Architecture
+![Project Architecture](architecture_diagram.png)
 
 ## 주요 성과
 ### 1. 모델 아키텍처 및 추론 알고리즘 고도화
-- **스크래치 구현 및 최적화**: 0.08B 파라미터 규모의 경량 Transformer 모델을 직접 설계 및 구현하여 한국어-영어 번역 최적화.
+- **Zero-base 구현 및 최적화**: 0.08B 파라미터 규모의 경량 Transformer 모델을 직접 설계 및 구현하여 한국어-영어 번역 최적화.
 - **최신 아키텍처 반영**: RoPE(Rotary Positional Embedding), GQA(Grouped Query Attention), SwiGLU를 도입하여 모델 구조적 성능 개선.
 - **추론 효율성 극대화**: KV Cache 구현을 통해 토큰 생성 속도를 향상시켰으며, Beam Search를 적용해 단순 Greedy 방식 대비 번역 품질의 일관성 확보.
-- **양자화 적용**: 모델 인퍼런스 비용 절감을 위해 `int8` 양자화를 수행, 모델 용량 최적화 및 추론 속도 개선.
+- **양자화 적용**: 모델 인퍼런스 비용 절감을 위해 `ONNXRuntime.quantization`를 통해 `int8` 양자화를 수행, 모델 용량 최적화 및 추론 속도 개선.
 
 ### 2. AWS 기반의 비용 효율적 서버리스 파이프라인 구축
 - **서버리스 아키텍처 설계**: SageMaker Serverless Inference를 활용해 상시 가동 비용을 제거하고, 요청 발생 시에만 과금되는 경제적인 배포 환경 구축 (EC2 대비 비용 획기적 절감).
@@ -40,7 +42,8 @@
 
 ## 품질
 - Validation loss: 1epoch 학습 후 0.69까지 감소, 이후 개선이 없어 학습 중지
-- Validation BLEU 구간: 약 `0.28 ~ 0.68`
+- Validation BLEU 구간: 약 `0.28 ~ 0.68` (단문장 점수) -> 준수한 성능
+    - **BLEU Score란?** 번역 품질을 측정한느 지표. 일반적으로 0.3 이상 구간이면 의미있는 수준의 성능으로 판단하고, 0.5 이상 구간에서는 원문과 의미상 동일한 전문가 수준 번역으로 간주
 - 전문 분야 도메인 샘플에서도 비교적 안정적인 문장 구조 유지
 - 문장 길이가 길거나 동음이의어가 많은 경우 다소 성능이 떨어지나, 주요 의미 전달은 대체로 성공
 
@@ -110,3 +113,8 @@ curl -X POST "https://k3tor5wxkjmu66oz3ypvfpvfo40noryg.lambda-url.ap-northeast-2
 - [aws_deployment/src/sample_request.py](aws_deployment/src/sample_request.py)
 
 # Frontend
+
+# Limitations and Future Work
+- 모델 성능: 0.08B 모델로는 긴 문장이나 동음이의어, 전문 용어에서 완벽한 번역이 어려운 경우가 있음. 데이터셋을 늘리고 모델 stack 을 쌓고 hidden_dim 을 늘리면 향후 1B 이상 모델로 확장 가능
+- 배포 최적화: 현재는 SageMaker Serverless Inference로 배포했지만, cold start 문제나 대규모 트래픽 대응 측면에서 개선 여지가 있음. 지금 0.08B 모델도 답변시까지 10~20초 가량의 시간이 소요. 모델 규모가 더 커지면 SageMaker GPU 인스턴스를 활용한다면 좋을 듯함
+- API 기능 확장: 현재는 단순 번역 API만 제공하지만, 향후 문장 요약, 질문 응답 등 다양한 NLP 기능으로 확장 가능
