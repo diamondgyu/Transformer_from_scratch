@@ -23,3 +23,7 @@ Wmt19 en-de (used the part of it; 3M rows)
 - Techniques like AutoAMP
 - Better tokenizer (T5)
 - Better data (wmt14 in original vs wmt19 for this model)
+
+## Deployment
+- 왜 이렇게 느린가요?
+- 시연이라는 목적에 충실하기 위해 가장 저렴한 lambda 를 사용했고, 상용이라면 sagemaker serverless inference나 ec2 gpu instance를 사용할 것

@@ -1,8 +1,17 @@
-logs/*
-data/*.xlsx
-data/*.json
-data/*/
-models/*
+# Ignore IDE and Python cache files
 .vscode/
 __pycache__/
-wandb/
+
+# Ignore files and directories related to model training and development
+model_training/logs/*
+model_training/data/*.xlsx
+model_training/data/*.json
+model_training/data/*/
+model_training/models/*
+model_training/wandb/
+
+# Ignore files related to deployment
+lambda_deployment/models/*
+*.tar.gz
+
+

@@ -1,0 +1,6 @@
+numpy>=1.26.0
+transformers>=4.40.0
+onnxruntime>=1.18.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+requests>=2.31.0

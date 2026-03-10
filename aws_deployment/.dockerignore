@@ -1,0 +1,9 @@
+# .dockerignore
+__pycache__/
+*.pyc
+venv/
+.git/
+.env
+data/
+models/
+*.tar.gz
