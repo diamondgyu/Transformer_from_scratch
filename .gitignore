@@ -1,6 +1,7 @@
 # Ignore IDE and Python cache files
 .vscode/
 __pycache__/
+.DS_Store
 
 # Ignore files and directories related to model training and development
 model_training/logs/*
