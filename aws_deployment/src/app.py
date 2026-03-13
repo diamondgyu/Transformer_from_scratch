@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import numpy as np
 import os
 import sys
@@ -12,7 +12,7 @@ if current_dir not in sys.path:
 
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from util import create_ort_session, beam_generate_onnx, cut_string_between_bos_eos
+from util import create_ort_session, beam_generate_onnx, sample_generate_onnx, cut_string_between_bos_eos
 
 
 os.environ.setdefault("HF_HOME", "/tmp/huggingface")
@@ -34,6 +34,14 @@ tokenizer_max_len = int(os.environ.get("TOKENIZER_MAX_LEN", "128"))
 
 class InvocationRequest(BaseModel):
 	text: str
+	do_sample: bool = True
+	temperature: float = Field(default=0.9, gt=0.0, le=5.0)
+	top_k: int = Field(default=50, ge=0, le=1000)
+	top_p: float = Field(default=0.95, gt=0.0, le=1.0)
+	repetition_penalty: float = Field(default=1.2, ge=1.0, le=3.0)
+	num_beams: int = Field(default=3, ge=1, le=10)
+	length_penalty: float = Field(default=1.0, ge=0.1, le=3.0)
+	seed: Optional[int] = Field(default=None, ge=0)
 
 
 def _require_int_token_id(token_id, name: str) -> int:
@@ -88,7 +96,18 @@ def get_model() -> tuple[PreTrainedTokenizerBase, object]:
 	return tokenizer, ort_session
 
 
-def _translate_text(text: str) -> str:
+def _translate_text(
+	text: str,
+	*,
+	do_sample: bool,
+	temperature: float,
+	top_k: int,
+	top_p: float,
+	repetition_penalty: float,
+	num_beams: int,
+	length_penalty: float,
+	seed: Optional[int],
+) -> str:
 	tkn, sess = get_model()
 
 	test_input = tkn(
@@ -104,17 +123,32 @@ def _translate_text(text: str) -> str:
 	eos_token_id = _require_int_token_id(tkn.eos_token_id, "eos_token_id")
 	pad_token_id = _require_int_token_id(tkn.pad_token_id, "pad_token_id")
 
-	output_ids = beam_generate_onnx(
-		sess,
-		src_ids=input_ids,
-		bos_token_id=bos_token_id,
-		eos_token_id=eos_token_id,
-		pad_token_id=pad_token_id,
-		max_len=tokenizer_max_len,
-		num_beams=3,
-		length_penalty=1.0,
-		repetition_penalty=1.3,
-	)
+	if do_sample:
+		output_ids = sample_generate_onnx(
+			sess,
+			src_ids=input_ids,
+			bos_token_id=bos_token_id,
+			eos_token_id=eos_token_id,
+			pad_token_id=pad_token_id,
+			max_len=tokenizer_max_len,
+			temperature=temperature,
+			top_k=top_k,
+			top_p=top_p,
+			repetition_penalty=repetition_penalty,
+			seed=seed,
+		)
+	else:
+		output_ids = beam_generate_onnx(
+			sess,
+			src_ids=input_ids,
+			bos_token_id=bos_token_id,
+			eos_token_id=eos_token_id,
+			pad_token_id=pad_token_id,
+			max_len=tokenizer_max_len,
+			num_beams=num_beams,
+			length_penalty=length_penalty,
+			repetition_penalty=repetition_penalty,
+		)
 
 	output_sentences = tkn.batch_decode(output_ids.tolist(), skip_special_tokens=False)
 	return cut_string_between_bos_eos(output_sentences[0])
@@ -135,7 +169,17 @@ async def invocations(request: InvocationRequest) -> dict:
 		raise HTTPException(status_code=400, detail="Empty input text")
 
 	try:
-		translation = _translate_text(request.text)
+		translation = _translate_text(
+			request.text,
+			do_sample=request.do_sample,
+			temperature=request.temperature,
+			top_k=request.top_k,
+			top_p=request.top_p,
+			repetition_penalty=request.repetition_penalty,
+			num_beams=request.num_beams,
+			length_penalty=request.length_penalty,
+			seed=request.seed,
+		)
 		return {"translation": translation}
 	except HTTPException:
 		raise

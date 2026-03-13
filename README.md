@@ -92,7 +92,7 @@
 바로 써볼 수 있는 테스트 스크립트 (public endpoint via lambda URL):
 
 ```bash
-curl -X POST "https://k3tor5wxkjmu66oz3ypvfpvfo40noryg.lambda-url.ap-northeast-2.on.aws/" \
+curl -X POST "https://72nt91ko27.execute-api.ap-northeast-2.amazonaws.com/TranslatorStage" \
      -H "Content-Type: application/json" \
      -d '{"text": "양도계약의 합의파기에 의한 소유권이전등기의 말소 시 취득처리에 대한 취득세 부과여부에 대한 판결"}'
 ```

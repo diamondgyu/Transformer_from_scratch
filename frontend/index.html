@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Korean → English Translator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f2f5;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 2rem 1rem;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.10);
+      padding: 2rem;
+      width: 100%;
+      max-width: 860px;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #1a1a2e;
+      margin-bottom: 1.5rem;
+      text-align: center;
+    }
+
+    textarea#input {
+      width: 100%;
+      height: 140px;
+      padding: 0.75rem 1rem;
+      font-size: 1rem;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      resize: vertical;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    textarea#input:focus { border-color: #4f46e5; }
+    textarea#input:disabled { background: #f9fafb; color: #6b7280; }
+
+    .btn-row {
+      display: flex;
+      justify-content: center;
+      margin: 1.25rem 0;
+    }
+
+    button#translate-btn {
+      background: #4f46e5;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      padding: 0.65rem 2.5rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: background 0.2s, opacity 0.2s;
+      min-width: 140px;
+      justify-content: center;
+    }
+    button#translate-btn:hover:not(:disabled) { background: #4338ca; }
+    button#translate-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2.5px solid rgba(255,255,255,0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #error-msg {
+      color: #dc2626;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      padding: 0.6rem 1rem;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+      display: none;
+    }
+
+    .outputs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    @media (max-width: 600px) {
+      .outputs { grid-template-columns: 1fr; }
+    }
+
+    .output-box {
+      border: 1.5px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-height: 120px;
+    }
+
+    .output-label {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .output-text {
+      flex: 1;
+      font-size: 0.97rem;
+      color: #111827;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 60px;
+    }
+
+    .output-text.placeholder { color: #9ca3af; font-style: italic; }
+
+    .copy-btn {
+      align-self: flex-end;
+      background: #f3f4f6;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      padding: 0.3rem 0.75rem;
+      font-size: 0.82rem;
+      cursor: pointer;
+      color: #374151;
+      transition: background 0.2s, color 0.2s, border-color 0.2s;
+    }
+    .copy-btn:hover { background: #e5e7eb; }
+    .copy-btn.copied {
+      background: #dcfce7;
+      border-color: #86efac;
+      color: #16a34a;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Korean → English Translator</h1>
+
+    <textarea id="input" placeholder="한국어 텍스트를 입력하세요…"></textarea>
+
+    <div class="btn-row">
+      <button id="translate-btn">
+        <span class="spinner" id="spinner"></span>
+        <span id="btn-label">Translate</span>
+      </button>
+    </div>
+
+    <div id="error-msg"></div>
+
+    <div class="outputs">
+      <div class="output-box">
+        <span class="output-label">Translation 1</span>
+        <div class="output-text placeholder" id="output1">Translation will appear here.</div>
+        <button class="copy-btn" id="copy1" onclick="onCopy(1)">Copy</button>
+      </div>
+      <div class="output-box">
+        <span class="output-label">Translation 2</span>
+        <div class="output-text placeholder" id="output2">Translation will appear here.</div>
+        <button class="copy-btn" id="copy2" onclick="onCopy(2)">Copy</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API_URL = "https://72nt91ko27.execute-api.ap-northeast-2.amazonaws.com/TranslatorStage";
+    const DPO_FEEDBACK_URL = "";
+    const DEFAULT_DECODING_OPTIONS = {
+      do_sample: true,
+      temperature: 0.5,
+      top_k: 40,
+      top_p: 0.8,
+      repetition_penalty: 1.15,
+    };
+
+    const inputEl      = document.getElementById("input");
+    const translateBtn = document.getElementById("translate-btn");
+    const spinnerEl    = document.getElementById("spinner");
+    const btnLabel     = document.getElementById("btn-label");
+    const errorMsg     = document.getElementById("error-msg");
+    const output1El    = document.getElementById("output1");
+    const output2El    = document.getElementById("output2");
+    const copy1Btn     = document.getElementById("copy1");
+    const copy2Btn     = document.getElementById("copy2");
+
+    translateBtn.addEventListener("click", translate);
+
+    async function translate() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      setLoading(true);
+      hideError();
+
+      try {
+        const [translation1, translation2] = await Promise.all([
+          requestTranslation(text),
+          requestTranslation(text),
+        ]);
+
+        setText(output1El, translation1);
+        setText(output2El, translation2);
+      } catch (err) {
+        showError(toUserErrorMessage(err));
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    function toUserErrorMessage(err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        return "브라우저에서 API 요청이 차단되었습니다(CORS). API Gateway에서 POST/OPTIONS CORS를 허용해 주세요.";
+      }
+
+      return err?.message || "Translation failed. Please try again.";
+    }
+
+    async function requestTranslation(text) {
+      const headers = { "Content-Type": "application/json" };
+      const body = JSON.stringify({ text, ...DEFAULT_DECODING_OPTIONS });
+      const res = await fetch(API_URL, { method: "POST", headers, body });
+
+      if (!res.ok) {
+        throw new Error(`API error: ${res.status}`);
+      }
+
+      const data = await res.json();
+      const translation = typeof data.translation === "string" ? data.translation.trim() : "";
+
+      if (!translation) {
+        throw new Error("API response missing translation.");
+      }
+
+      return translation;
+    }
+
+    function setText(el, text) {
+      el.textContent = text;
+      el.classList.remove("placeholder");
+    }
+
+    function setLoading(on) {
+      translateBtn.disabled = on;
+      inputEl.disabled       = on;
+      spinnerEl.style.display = on ? "block" : "none";
+      btnLabel.textContent    = on ? "Translating…" : "Translate";
+    }
+
+    function showError(msg) {
+      errorMsg.textContent   = msg;
+      errorMsg.style.display = "block";
+    }
+
+    function hideError() {
+      errorMsg.style.display = "none";
+    }
+
+    function onCopy(which) {
+      const [chosenEl, rejectedEl, btn] = which === 1
+        ? [output1El, output2El, copy1Btn]
+        : [output2El, output1El, copy2Btn];
+
+      const chosen   = chosenEl.textContent;
+      const rejected = rejectedEl.textContent;
+
+      if (!chosen || chosenEl.classList.contains("placeholder")) return;
+
+      navigator.clipboard.writeText(chosen).then(() => {
+        btn.textContent = "✓ Copied";
+        btn.classList.add("copied");
+        setTimeout(() => {
+          btn.textContent = "Copy";
+          btn.classList.remove("copied");
+        }, 2000);
+      });
+
+      sendDpoPreference(inputEl.value.trim(), chosen, rejected);
+    }
+
+    function sendDpoPreference(sourceText, chosenText, rejectedText) {
+      const payload = {
+        source_text: sourceText,
+        chosen_text: chosenText,
+        rejected_text: rejectedText,
+      };
+
+      if (!DPO_FEEDBACK_URL) {
+        console.info("DPO feedback payload", payload);
+        return;
+      }
+
+      fetch(DPO_FEEDBACK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      }).catch((error) => {
+        console.warn("Failed to send DPO feedback", error);
+      });
+    }
+  </script>
+</body>
+</html>

@@ -14,7 +14,12 @@ def invoke_sagemaker_endpoint():
     
     # 모델에 던질 테스트 데이터
     payload = {
-        "text": "양도계약의 합의파기시 소유권이전등기의 등록말소로 취득처리시 취득세부과의 여부에 대한 판결"
+        "text": "양도계약의 합의파기시 소유권이전등기의 등록말소로 취득처리시 취득세부과의 여부에 대한 판결",
+        "do_sample": True,
+        "temperature": 1.1,
+        "top_k": 80,
+        "top_p": 0.92,
+        "repetition_penalty": 1.15
     }
     
     start_time = time.time()

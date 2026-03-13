@@ -12,7 +12,7 @@ model_training/models/*
 model_training/wandb/
 
 # Ignore files related to deployment
-lambda_deployment/models/*
+aws_deployment/models/*
 *.tar.gz
 
 
