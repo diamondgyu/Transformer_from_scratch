@@ -11,20 +11,25 @@ WORKDIR /opt/program
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/tmp/huggingface \
-    MODEL_PATH=/opt/ml/model/model-quantized.onnx \
+    MODEL_PATH=/opt/ml/model/model.pt \
+    MODEL_CONFIG_PATH=/opt/ml/model/model-config.json \
     TOKENIZER_PATH=/opt/ml/model/tokenizer \
     TOKENIZER_MAX_LEN=128 \
     PYTHONPATH="/opt/program"
 
-# 의존성 설치
+# 의존성 설치 (CPU-only torch wheel — saves ~1 GB vs default CUDA wheel)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir torch>=2.1.0 --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir numpy>=1.26.0 transformers>=4.40.0 fastapi>=0.110.0 uvicorn>=0.29.0 requests>=2.31.0
 
 # 소스 코드 복사
 COPY . .
 
 # serve 파일에 실행 권한 부여 (반드시 필요)
 RUN chmod +x /opt/program/serve
+
+# SageMaker 전용 ENTRYPOINT 설정
+ENTRYPOINT ["/opt/program/serve"]
 
 # 환경 변수 PATH에 현재 디렉토리 추가 (SageMaker가 serve를 찾을 수 있게)
 ENV PATH="/opt/program:${PATH}"

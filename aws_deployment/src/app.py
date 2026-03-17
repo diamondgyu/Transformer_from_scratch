@@ -1,40 +1,43 @@
-from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel, Field
-import numpy as np
+import json
 import os
 import sys
 from pathlib import Path
 from typing import Optional
 
+import torch
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel, Field
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
 current_dir = str(Path(__file__).resolve().parent)
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
-
-from util import create_ort_session, beam_generate_onnx, sample_generate_onnx, cut_string_between_bos_eos
+from util import load_model, beam_generate, cut_string_between_bos_eos
 
 
 os.environ.setdefault("HF_HOME", "/tmp/huggingface")
 
 THIS_DIR = Path(__file__).resolve().parent
 DEPLOY_ROOT = THIS_DIR.parent
-DEFAULT_MODEL_PATH = DEPLOY_ROOT / "models" / "model-quantized.onnx"
+DEFAULT_MODEL_PATH = DEPLOY_ROOT / "models" / "model.pt"
+DEFAULT_MODEL_CONFIG_PATH = DEPLOY_ROOT / "models" / "model-config.json"
 DEFAULT_TOKENIZER_PATH = DEPLOY_ROOT / "models" / "tokenizer"
+
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", str(DEFAULT_MODEL_PATH)))
+MODEL_CONFIG_PATH = Path(os.environ.get("MODEL_CONFIG_PATH", str(DEFAULT_MODEL_CONFIG_PATH)))
 TOKENIZER_PATH = Path(os.environ.get("TOKENIZER_PATH", str(DEFAULT_TOKENIZER_PATH)))
 
 app = FastAPI(title="Transformer Translation Inference")
 
 tokenizer: Optional[PreTrainedTokenizerBase] = None
-ort_session = None
+pt_model = None
 init_error: Optional[str] = None
 tokenizer_max_len = int(os.environ.get("TOKENIZER_MAX_LEN", "128"))
 
 
 class InvocationRequest(BaseModel):
 	text: str
-	do_sample: bool = True
 	temperature: float = Field(default=0.9, gt=0.0, le=5.0)
 	top_k: int = Field(default=50, ge=0, le=1000)
 	top_p: float = Field(default=0.95, gt=0.0, le=1.0)
@@ -44,111 +47,77 @@ class InvocationRequest(BaseModel):
 	seed: Optional[int] = Field(default=None, ge=0)
 
 
-def _require_int_token_id(token_id, name: str) -> int:
-	if not isinstance(token_id, int):
-		raise RuntimeError(f"Tokenizer {name} is not an int.")
-	return token_id
-
-
-def _resolve_path(path: Path, name: str) -> Path:
-	if path.exists():
-		return path
-	raise RuntimeError(f"{name} not found: {path}")
-
-
 def init_model() -> None:
-    global tokenizer, ort_session, init_error
-    
-    if tokenizer is not None and ort_session is not None:
+    global tokenizer, pt_model, init_error
+
+    if tokenizer is not None and pt_model is not None:
         return
 
     try:
-        # SageMaker가 S3에서 내려받아 압축을 푼 파일 확인
         if not MODEL_PATH.exists():
             raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
-            
+        if not MODEL_CONFIG_PATH.exists():
+            raise FileNotFoundError(f"Model config not found at {MODEL_CONFIG_PATH}")
+
         print(f"Loading tokenizer from {TOKENIZER_PATH}...")
         tokenizer_local = AutoTokenizer.from_pretrained(str(TOKENIZER_PATH), local_files_only=True)
-        
-        # 특수 토큰 설정 생략 (기존 로직 유지)
         if tokenizer_local.pad_token is None:
             tokenizer_local.pad_token = tokenizer_local.eos_token or tokenizer_local.cls_token
 
-        print(f"Loading ONNX session from {MODEL_PATH}...")
-        session = create_ort_session(MODEL_PATH)
+        with open(MODEL_CONFIG_PATH) as f:
+            config = json.load(f)
+
+        print(f"Loading PyTorch model from {MODEL_PATH}...")
+        model = load_model(MODEL_PATH, config)
+        model.tokenizer = tokenizer_local
 
         tokenizer = tokenizer_local
-        ort_session = session
+        pt_model = model
         init_error = None
+        print("Model ready.")
     except Exception as error:
         init_error = str(error)
         print(f"Initialization failed: {init_error}")
         raise
 
-def get_model() -> tuple[PreTrainedTokenizerBase, object]:
-	if tokenizer is None or ort_session is None:
-		print("Loading model for the first request...")
-		init_model()
 
-	if tokenizer is None or ort_session is None:
-		raise RuntimeError(init_error or "Model not initialized")
+def get_model():
+    if tokenizer is None or pt_model is None:
+        print("Loading model for the first request...")
+        init_model()
 
-	return tokenizer, ort_session
+    if tokenizer is None or pt_model is None:
+        raise RuntimeError(init_error or "Model not initialized")
+
+    return tokenizer, pt_model
 
 
 def _translate_text(
 	text: str,
 	*,
-	do_sample: bool,
-	temperature: float,
-	top_k: int,
-	top_p: float,
 	repetition_penalty: float,
 	num_beams: int,
 	length_penalty: float,
-	seed: Optional[int],
 ) -> str:
-	tkn, sess = get_model()
+	tkn, model = get_model()
 
-	test_input = tkn(
+	encoding = tkn(
 		[text],
 		padding="max_length",
 		truncation=True,
-		return_tensors="np",
+		return_tensors="pt",
 		max_length=tokenizer_max_len,
 	)
+	input_ids: torch.Tensor = encoding.input_ids
 
-	input_ids = np.asarray(test_input["input_ids"], dtype=np.int64)
-	bos_token_id = _require_int_token_id(tkn.bos_token_id, "bos_token_id")
-	eos_token_id = _require_int_token_id(tkn.eos_token_id, "eos_token_id")
-	pad_token_id = _require_int_token_id(tkn.pad_token_id, "pad_token_id")
-
-	if do_sample:
-		output_ids = sample_generate_onnx(
-			sess,
-			src_ids=input_ids,
-			bos_token_id=bos_token_id,
-			eos_token_id=eos_token_id,
-			pad_token_id=pad_token_id,
-			max_len=tokenizer_max_len,
-			temperature=temperature,
-			top_k=top_k,
-			top_p=top_p,
-			repetition_penalty=repetition_penalty,
-			seed=seed,
-		)
-	else:
-		output_ids = beam_generate_onnx(
-			sess,
-			src_ids=input_ids,
-			bos_token_id=bos_token_id,
-			eos_token_id=eos_token_id,
-			pad_token_id=pad_token_id,
-			max_len=tokenizer_max_len,
-			num_beams=num_beams,
-			length_penalty=length_penalty,
-			repetition_penalty=repetition_penalty,
-		)
+	output_ids = beam_generate(
+		model,
+		src_ids=input_ids,
+		num_beams=num_beams,
+		max_len=tokenizer_max_len,
+		length_penalty=length_penalty,
+		repetition_penalty=repetition_penalty,
+	)
 
 	output_sentences = tkn.batch_decode(output_ids.tolist(), skip_special_tokens=False)
 	return cut_string_between_bos_eos(output_sentences[0])
@@ -168,17 +137,14 @@ async def invocations(request: InvocationRequest) -> dict:
 	if not request.text.strip():
 		raise HTTPException(status_code=400, detail="Empty input text")
 
+	print(f"DEBUG: Processing Beam Search request. num_beams={request.num_beams}, temp={request.temperature}")
+
 	try:
 		translation = _translate_text(
 			request.text,
-			do_sample=request.do_sample,
-			temperature=request.temperature,
-			top_k=request.top_k,
-			top_p=request.top_p,
 			repetition_penalty=request.repetition_penalty,
 			num_beams=request.num_beams,
 			length_penalty=request.length_penalty,
-			seed=request.seed,
 		)
 		return {"translation": translation}
 	except HTTPException:
@@ -190,10 +156,11 @@ async def invocations(request: InvocationRequest) -> dict:
 @app.get("/health")
 async def health() -> dict:
 	return {
-		"status": "healthy" if ort_session is not None else "initializing",
-		"model_ready": ort_session is not None,
+		"status": "healthy" if pt_model is not None else "initializing",
+		"model_ready": pt_model is not None,
 		"error": init_error,
 	}
+
 
 if __name__ == "__main__":
 	import uvicorn
