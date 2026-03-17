@@ -1,7 +1,17 @@
 # Transformer from Scratch
 
-한국어->영어 번역을 위한 Transformer 모델을 학습하고, AWS Serverless 기반으로 배포해 API 형태로 제공하는 프로젝트
-# Architecture
+한국어-영어 번역을 위한 Transformer 모델을 학습하고, AWS Serverless 기반으로 배포해 API 형태로 제공하는 프로젝트
+
+Link: https://d1bzovg3yqbyjp.cloudfront.net/
+
+## 기술 스택
+| Category | Stack |
+|---|---|
+| Neural NLP | PyTorch, Transformer, RoPE, GQA, SwiGLU, KV Cache, Beam Search |
+| Cloud | S3, ECR, SageMaker Serverless, Lambda, API Gateway, CloudFront |
+| Serving | FastAPI, Docker |
+
+## Architecture
 ![Project Architecture](architecture_diagram.png)
 
 ## 주요 성과
@@ -9,17 +19,17 @@
 - **Zero-base 구현 및 최적화**: 0.08B 파라미터 규모의 경량 Transformer 모델을 직접 설계 및 구현하여 한국어-영어 번역 최적화.
 - **최신 아키텍처 반영**: RoPE(Rotary Positional Embedding), GQA(Grouped Query Attention), SwiGLU를 도입하여 모델 구조적 성능 개선.
 - **추론 효율성 극대화**: KV Cache 구현을 통해 토큰 생성 속도를 향상시켰으며, Beam Search를 적용해 단순 Greedy 방식 대비 번역 품질의 일관성 확보.
-- **양자화 적용**: 모델 인퍼런스 비용 절감을 위해 `ONNXRuntime.quantization`를 통해 `int8` 양자화를 수행, 모델 용량 최적화 및 추론 속도 개선.
+- **추론 경량화**: `FP32` 기본 모델을 `BF16` 으로 변환해 용량과 소요시간을 절반으로 단축
 
 ### 2. AWS 기반의 비용 효율적 서버리스 파이프라인 구축
-- **서버리스 아키텍처 설계**: SageMaker Serverless Inference를 활용해 상시 가동 비용을 제거하고, 요청 발생 시에만 과금되는 경제적인 배포 환경 구축 (EC2 대비 비용 획기적 절감).
-- **Full-Stack 인프라 연동**: `S3`(모델) + `ECR`(컨테이너) + `SageMaker`(추론) + `Lambda`(API Gateway)를 유기적으로 연결하는 MLOps 파이프라인 완성.
+- **서버리스 아키텍처 설계**: SageMaker Serverless Inference를 활용해 상시 가동 비용을 제거하고, 요청 발생 시에만 과금되는 경제적인 배포 환경 구축 (always-on 대비 비용 획기적 절감). 이때 provisioned concurrency 를 설정하여 pytorch 인프라를 로딩하는 데 걸리는 cold start 문제를 완화
+- **Full-Stack 인프라 연동**: `S3`(모델) + `ECR`(컨테이너) + `SageMaker`(추론) + `Lambda` + `API Gateway`를 유기적으로 연결하는 파이프라인 완성.
 - **컨테이너 기반 배포**: Docker와 ECR을 활용해 추론 환경을 이미지화하여 환경 일관성을 보장하고 배포 프로세스를 자동화.
 
 # Model Training
 
 ## 목표
-- 법률/전문 문장을 포함한 한국어 문장을 영어로 번역하는 경량 Transformer(0.08B) 모델 학습
+- 일반적 구어부터 뉴스/법률/전문 문장을 포함한 한국어 문장을 영어로 번역하는 경량 Transformer(0.08B) 모델 학습
 - 단순 동작 수준을 넘어, Beam Search나 KV Cache 등 추론 품질/효율 개선 요소를 반영
 
 ## 데이터셋
@@ -31,39 +41,41 @@
 
 
 ## 학습 과정 요약
-- 초기 버전(25.03): DE->EN 실험 경험 기반으로 동작은 했지만, attention scaling/sacrebleu 평가/추론 최적화 측면에서 한계가 명확했습니다.
-- 개선 버전(26.03):
-	- 토크나이저를 `FacebookAI/xlm-roberta-base`에서 `klue/roberta-base`로 변경
-	- 한국어 토크나이저 특수토큰(`bos/eos/pad`) 매핑 보강
-	- LR 스케일 조정, 헤드/스택 조정 등으로 학습 정체 구간 개선
-	- Beam Search, KV Cache, GQA, SwiGLU, RoPE 등 구조적 개선 반영
+### 초기 버전(25.03):
+- DE->EN 실험 경험 기반으로 동작은 했지만, attention scaling/sacrebleu 평가/추론 최적화 측면에서 한계가 명확.
+### 개선 버전(26.03):
+- 토크나이저를 `FacebookAI/xlm-roberta-base`에서 `klue/roberta-base`로 변경
+- 한국어 토크나이저 특수토큰(`bos/eos/pad`) 매핑 보강
+- LR 스케일 조정, 헤드/스택 조정 등으로 학습 정체 구간 개선
+- Beam Search, KV Cache, GQA, SwiGLU, RoPE 등 구조적 개선 반영
 
-상세 로그는 [model_training/update_log.md](model_training/update_log.md)에서 확인할 수 있습니다.
+상세 로그는 [model_training/update_log.md](model_training/update_log.md)에서 확인가능.
 
 ## 품질
 - Validation loss: 1epoch 학습 후 0.69까지 감소, 이후 개선이 없어 학습 중지
 - Validation BLEU 구간: 약 `0.28 ~ 0.68` (단문장 점수) -> 준수한 성능
-    - **BLEU Score란?** 번역 품질을 측정한느 지표. 일반적으로 0.3 이상 구간이면 의미있는 수준의 성능으로 판단하고, 0.5 이상 구간에서는 원문과 의미상 동일한 전문가 수준 번역으로 간주
+    - _**BLEU Score란?**_ 번역 품질을 측정하는 지표. 일반적으로 0.3 이상 구간이면 의미있는 수준의 번역으로 판단하고, 0.45 이상 구간에서는 전문 번역가 수준으로 간주
 - 전문 분야 도메인 샘플에서도 비교적 안정적인 문장 구조 유지
 - 문장 길이가 길거나 동음이의어가 많은 경우 다소 성능이 떨어지나, 주요 의미 전달은 대체로 성공
 
-실제 샘플 일부 분석은 [model_training/sample_generation.md](model_training/sample_generation.md)에 정리되어 있습니다.
+실제 샘플 일부 분석은 [model_training/sample_generation.md](model_training/sample_generation.md)에 정리됨.
 
 # Deployment on AWS
 
 ## 아키텍처
-현재 배포 경로는 아래와 같습니다.
+### 현재 배포 경로:
 
-`S3(model artifacts) + ECR(image) -> SageMaker Endpoint(Serverless Inference) -> Lambda(URL)`
+![Project Architecture](architecture_diagram.png)
 
-- 모델 파일은 `int8` 양자화된 상태로 S3에 업로드
+- 모델 파일은 `BF16` 압축 상태로 S3에 업로드
 - S3에 저장된 모델 파일을 SageMaker 경로(`/opt/ml/model`)에 탑재
 - 추론 서버 이미지는 ECR에 업로드
 - SageMaker Serverless Endpoint가 실제 추론 수행
-- Lambda는 외부 요청을 받아 Endpoint를 invoke하는 진입점 역할
+- Lambda는 외부 요청을 받아 Endpoint와 중개
+- API Gateway는 lambda를  invoke하는 진입점 역할
 
 ## 배포 전략 선택 배경
-- EC2 직접 배포: 상시 인스턴스 비용 부담이 큼 (7만원/mo 이상)
+- EC2 직접 배포: 상시 인스턴스 비용 부담이 큼 (10만원/mo 이상)
 - Lambda 단독 모델 구동: 메모리 제약으로 OOM 발생
 - 최종 선택: SageMaker Serverless Inference (비용/성능 균형)
 
@@ -89,7 +101,7 @@
 }
 ```
 
-바로 써볼 수 있는 테스트 스크립트 (public endpoint via lambda URL):
+바로 써볼 수 있는 테스트 스크립트 (public endpoint via A):
 
 ```bash
 curl -X POST "https://72nt91ko27.execute-api.ap-northeast-2.amazonaws.com/TranslatorStage" \
@@ -113,8 +125,18 @@ curl -X POST "https://72nt91ko27.execute-api.ap-northeast-2.amazonaws.com/Transl
 - [aws_deployment/src/sample_request.py](aws_deployment/src/sample_request.py)
 
 # Frontend
+- 간단한 HTML/CSS/JS로 구성된 웹 인터페이스
+- 사용자 입력을 받아 API 호출 후 번역 결과를 화면에 표시
+- `index.html`에서 API 엔드포인트 URL과 요청/응답 처리 로직 구현
+- `CloudFront`를 통해 글로벌 배포, 접속 가능
+
+- https://d1bzovg3yqbyjp.cloudfront.net/
 
 # Limitations and Future Work
-- 모델 성능: 0.08B 모델로는 긴 문장이나 동음이의어, 전문 용어에서 완벽한 번역이 어려운 경우가 있음. 데이터셋을 늘리고 모델 stack 을 쌓고 hidden_dim 을 늘리면 향후 1B 이상 모델로 확장 가능
-- 배포 최적화: 현재는 SageMaker Serverless Inference로 배포했지만, cold start 문제나 대규모 트래픽 대응 측면에서 개선 여지가 있음. 지금 0.08B 모델도 답변시까지 10~20초 가량의 시간이 소요. 모델 규모가 더 커지면 SageMaker GPU 인스턴스를 활용한다면 좋을 듯함
-- API 기능 확장: 현재는 단순 번역 API만 제공하지만, 향후 문장 요약, 질문 응답 등 다양한 NLP 기능으로 확장 가능
+### 모델 성능
+0.08B 모델로는 긴 문장이나 동음이의어, 전문 용어에서 완벽한 번역이 어려운 경우가 있음. 데이터셋을 늘리고 모델 stack 을 쌓고 hidden_dim 을 늘리면 향후 1B 이상 모델로 확장 가능. 현대 transformer model 들은 20~30스택 이상, hiddem dim 4096 쌓아 고성능을 내는 경우가 대부분
+
+### 배포 최적화
+현재는 SageMaker Serverless Inference로 배포했지만, cold start 문제나 대규모 트래픽 대응 측면에서 개선 여지가 있음. 지금 0.08B 모델도 답변시까지 몇 초 가량의 시간이 소요. 모델 규모가 더 커지면 SageMaker GPU 인스턴스를 활용해 vllm/sglang 을 통해 서빙하고, 정말 business scale 확장을 한다면 EKS(Kubernetes Pod) / ELB 활용한다면 좋을 듯함
+### API 기능 확장
+현재는 단순 번역 API만 제공하지만, 향후 문장 요약, 질문 응답 등 다양한 NLP 기능으로 확장 가능. Next token prediction 방식으로 학습하고 SFT/RLHF 적용하면 실제 GPT-4 수준의 대화형 모델로도 확장 가능할 듯
