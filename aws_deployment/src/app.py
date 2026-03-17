@@ -137,7 +137,7 @@ async def invocations(request: InvocationRequest) -> dict:
 	if not request.text.strip():
 		raise HTTPException(status_code=400, detail="Empty input text")
 
-	print(f"DEBUG: Processing Beam Search request. num_beams={request.num_beams}, temp={request.temperature}")
+	print(f"DEBUG: Request payload - text='{request.text[:20]}...', num_beams={request.num_beams}, temp={request.temperature}, penalty={request.repetition_penalty}")
 
 	try:
 		translation = _translate_text(
@@ -146,6 +146,7 @@ async def invocations(request: InvocationRequest) -> dict:
 			num_beams=request.num_beams,
 			length_penalty=request.length_penalty,
 		)
+		print(f"DEBUG: Generated translation - '{translation[:30]}...'")
 		return {"translation": translation}
 	except HTTPException:
 		raise
